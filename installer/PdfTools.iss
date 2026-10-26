@@ -36,13 +36,29 @@ Source: "verify-key.ps1"; Flags: dontcopy
 Name: "{autoprograms}\iLovePDF Tools Settings"; Filename: "{app}\PdfToolsSettings.exe"
 
 ; Right-click entries (classic menu = "Show more options" on Windows 11). Per-user, so no admin needed.
+; File types with more than one tool (.pdf, .jpg, .jpeg) get a single "iLovePDF" cascading submenu.
+; File types with a single tool (.doc, .docx, .ppt, .pptx) stay as one flat entry.
 [Registry]
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools.Compress"; ValueType: string; ValueName: ""; ValueData: "iLovePDF: Compress PDF"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools.Compress"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools.Compress\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" compress ""%1"""
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools.Merge"; ValueType: string; ValueName: ""; ValueData: "iLovePDF: Merge PDFs"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools.Merge"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools.Merge\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" merge ""%1"""
+; --- Clean up the old flat entries from earlier versions (prevents duplicates after upgrade) ---
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools.Compress"; Flags: deletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools.Merge"; Flags: deletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools.ToPdf"; Flags: deletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools.Combine"; Flags: deletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools.ToPdf"; Flags: deletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools.Combine"; Flags: deletekey
+
+; --- .pdf submenu ---
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools"; ValueType: string; ValueName: "MUIVerb"; ValueData: "iLovePDF"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools"; ValueType: string; ValueName: "SubCommands"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools\shell\01compress"; ValueType: string; ValueName: ""; ValueData: "Compress PDF"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools\shell\01compress"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools\shell\01compress\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" compress ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools\shell\02merge"; ValueType: string; ValueName: ""; ValueData: "Merge PDFs"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools\shell\02merge"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools\shell\02merge\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" merge ""%1"""
+
+; --- .doc / .docx / .ppt / .pptx (single tool: flat entry) ---
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.doc\shell\PdfTools.ToPdf"; ValueType: string; ValueName: ""; ValueData: "iLovePDF: Convert to PDF"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.doc\shell\PdfTools.ToPdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.doc\shell\PdfTools.ToPdf\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" office2pdf ""%1"""
@@ -55,18 +71,28 @@ Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ppt\shell\PdfTools
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pptx\shell\PdfTools.ToPdf"; ValueType: string; ValueName: ""; ValueData: "iLovePDF: Convert to PDF"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pptx\shell\PdfTools.ToPdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pptx\shell\PdfTools.ToPdf\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" office2pdf ""%1"""
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools.ToPdf"; ValueType: string; ValueName: ""; ValueData: "iLovePDF: Convert to PDF"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools.ToPdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools.ToPdf\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" img2pdf ""%1"""
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools.Combine"; ValueType: string; ValueName: ""; ValueData: "iLovePDF: Combine into one PDF"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools.Combine"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools.Combine\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" imgcombine ""%1"""
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools.ToPdf"; ValueType: string; ValueName: ""; ValueData: "iLovePDF: Convert to PDF"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools.ToPdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools.ToPdf\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" img2pdf ""%1"""
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools.Combine"; ValueType: string; ValueName: ""; ValueData: "iLovePDF: Combine into one PDF"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools.Combine"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools.Combine\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" imgcombine ""%1"""
+
+; --- .jpg submenu ---
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools"; ValueType: string; ValueName: "MUIVerb"; ValueData: "iLovePDF"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools"; ValueType: string; ValueName: "SubCommands"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools\shell\01topdf"; ValueType: string; ValueName: ""; ValueData: "Convert to PDF"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools\shell\01topdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools\shell\01topdf\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" img2pdf ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools\shell\02combine"; ValueType: string; ValueName: ""; ValueData: "Combine into one PDF"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools\shell\02combine"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpg\shell\PdfTools\shell\02combine\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" imgcombine ""%1"""
+
+; --- .jpeg submenu ---
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools"; ValueType: string; ValueName: "MUIVerb"; ValueData: "iLovePDF"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools"; ValueType: string; ValueName: "SubCommands"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools\shell\01topdf"; ValueType: string; ValueName: ""; ValueData: "Convert to PDF"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools\shell\01topdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools\shell\01topdf\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" img2pdf ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools\shell\02combine"; ValueType: string; ValueName: ""; ValueData: "Combine into one PDF"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools\shell\02combine"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\PdfToolsRunner.exe,0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jpeg\shell\PdfTools\shell\02combine\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PdfToolsRunner.exe"" imgcombine ""%1"""
 
 [Run]
 Filename: "{app}\PdfToolsRunner.exe"; Parameters: "--init --key-file ""{tmp}\ilp_key.txt""{code:SkipValidationParam}"; Flags: runhidden waituntilterminated; Check: KeyWasEntered; StatusMsg: "Saving your API key..."
