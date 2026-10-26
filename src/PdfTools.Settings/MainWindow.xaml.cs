@@ -5,6 +5,7 @@ using System.Windows.Documents;
 using System.Windows.Media;
 using PdfTools.Core;
 using PdfTools.Core.ILoveApi;
+   using System.IO;
 
 namespace PdfTools.Settings;
 
