@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>PdfToolsSettings</AssemblyName>
+    <RootNamespace>PdfTools.Settings</RootNamespace>
+    <ApplicationIcon>..\..\assets\app.ico</ApplicationIcon>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\PdfTools.Core\PdfTools.Core.csproj" />
+    <Resource Include="..\..\assets\app.ico" Link="app.ico" />
+  </ItemGroup>
+</Project>
