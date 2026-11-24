@@ -1,12 +1,15 @@
 using System.Diagnostics;
 using System.IO.Pipes;
 using System.Text;
+using System.Threading.Channels;
 using System.Windows.Forms;
 using PdfTools.Core;
 using PdfTools.Core.ILoveApi;
 using PdfTools.Core.Jobs;
 
 namespace PdfTools.Runner;
+
+internal sealed record QueuedBatch(JobKind Kind, List<string> Files);
 
 /// <summary>
 /// Entry point for every right-click action.
@@ -27,7 +30,8 @@ internal static class Program
         if (args.Length == 0) { Shell.OpenSettings(); return 0; }
         if (args[0] == "--init") return InitCommand.Run(args);
 
-        if (!TryParseVerb(args[0], out var kind)) return 64;
+        var verb = args[0].ToLowerInvariant();
+        if (!TryParseVerb(verb, out var kind)) return 64;
         var paths = args.Skip(1)
             .Where(a => !string.IsNullOrWhiteSpace(a))
             .Select(a => { try { return Path.GetFullPath(a); } catch { return ""; } })
@@ -35,16 +39,66 @@ internal static class Program
             .ToList();
         if (paths.Count == 0) return 64;
 
-        // Explorer launches one process per selected file; the first one becomes the "leader"
-        // and gathers the paths of the others so Merge/Combine see the whole selection.
-        var batch = BatchCollector.Collect(args[0].ToLowerInvariant(), paths);
-        if (batch == null) return 0;     // we were a follower; the leader handles everything
+        var mutexName = @"Local\PdfTools.Runner.Active";
+        var pipeName = $"PdfTools.Runner.{Process.GetCurrentProcess().SessionId}.{Environment.UserName.Replace('\\', '_')}";
 
-        Application.Run(new JobContext(kind, batch));
-        return 0;
+        // Single-instance coordinator: if an active runner exists, forward (verb, paths) to its queue and exit.
+        // Otherwise become the active runner, accept concurrent incoming clicks, and exit automatically when idle.
+        Mutex? leaderMutex = AcquireOrForward(mutexName, pipeName, verb, paths);
+        if (leaderMutex == null) return 0;
+
+        try
+        {
+            using var server = new RunnerServer(pipeName);
+            server.Start();
+            server.EnqueueRaw(kind, paths);
+            Application.Run(new JobContext(server));
+            return 0;
+        }
+        finally
+        {
+            try { leaderMutex.ReleaseMutex(); } catch { }
+            leaderMutex.Dispose();
+        }
     }
 
-    private static bool TryParseVerb(string verb, out JobKind kind)
+    private static Mutex? AcquireOrForward(string mutexName, string pipeName, string verb, List<string> paths)
+    {
+        var sw = Stopwatch.StartNew();
+        var giveUp = TimeSpan.FromSeconds(6);
+
+        while (sw.Elapsed < giveUp)
+        {
+            var mutex = new Mutex(true, mutexName, out bool created);
+            if (created) return mutex;
+            mutex.Dispose();
+
+            if (TrySend(pipeName, verb, paths)) return null;
+            Thread.Sleep(40);
+        }
+
+        // Could not coordinate within timeout; fall back to running standalone with a local dummy mutex.
+        return new Mutex(false);
+    }
+
+    private static bool TrySend(string pipeName, string verb, List<string> paths)
+    {
+        try
+        {
+            using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.Out, PipeOptions.CurrentUserOnly);
+            client.Connect(300);
+            using var writer = new StreamWriter(client, new UTF8Encoding(false));
+            foreach (var p in paths)
+                writer.WriteLine($"{verb}\t{p}");
+            writer.Flush();
+            return true;
+        }
+        catch (TimeoutException) { return false; }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
+    }
+
+    internal static bool TryParseVerb(string verb, out JobKind kind)
     {
         switch (verb.ToLowerInvariant())
         {
@@ -58,78 +112,190 @@ internal static class Program
     }
 }
 
-/// <summary>Gathers the files of one multi-selection across the per-file processes Explorer starts.</summary>
-internal static class BatchCollector
+/// <summary>
+/// Concurrent CurrentUserOnly named-pipe receiver + per-verb debouncer feeding a bounded Channel queue.
+/// Coalesces Explorer's per-file launch storm (700ms quiet window) and buffers rapid follow-up right-clicks.
+/// </summary>
+internal sealed class RunnerServer : IDisposable
 {
     private static readonly TimeSpan QuietPeriod = TimeSpan.FromMilliseconds(700);
     private static readonly TimeSpan MaxCollect = TimeSpan.FromSeconds(8);
-    private static readonly TimeSpan GiveUp = TimeSpan.FromSeconds(6);
 
-    /// <returns>All collected paths if this process is the leader; null if it handed its path to a leader.</returns>
-    public static List<string>? Collect(string verb, List<string> initial)
+    private readonly string _pipeName;
+    private readonly CancellationTokenSource _cts = new();
+    private readonly Channel<QueuedBatch> _queue = Channel.CreateBounded<QueuedBatch>(
+        new BoundedChannelOptions(64) { FullMode = BoundedChannelFullMode.Wait, SingleReader = true, SingleWriter = false });
+
+    private readonly object _debounceLock = new();
+    private readonly Dictionary<JobKind, PendingBucket> _pending = new();
+    private int _queuedCount;
+
+    public ChannelReader<QueuedBatch> Reader => _queue.Reader;
+    public int QueuedCount => Volatile.Read(ref _queuedCount);
+    public event Action? BatchArrived;
+
+    public bool HasPending
     {
-        var mutexName = $@"Local\PdfTools.Batch.{verb}";
-        var pipeName = $"PdfTools.Batch.{Process.GetCurrentProcess().SessionId}.{Environment.UserName.Replace('\\', '_')}.{verb}";
-
-        var sw = Stopwatch.StartNew();
-        while (sw.Elapsed < GiveUp)
-        {
-            var mutex = new Mutex(true, mutexName, out bool created);
-            if (created)
-            {
-                try { return RunLeader(pipeName, initial); }
-                finally { mutex.ReleaseMutex(); mutex.Dispose(); }
-            }
-            mutex.Dispose();
-
-            if (TrySend(pipeName, initial)) return null;
-            Thread.Sleep(40);   // leader exists but its pipe isn't ready yet (or just closed): retry
-        }
-        return initial;         // could not coordinate; just handle our own file
+        get { lock (_debounceLock) return _pending.Count > 0; }
     }
 
-    private static List<string> RunLeader(string pipeName, List<string> initial)
+    public RunnerServer(string pipeName) => _pipeName = pipeName;
+
+    public void Start()
     {
-        var paths = new List<string>(initial);
-        var total = Stopwatch.StartNew();
-        var quiet = Stopwatch.StartNew();
+        _ = Task.Run(AcceptLoopAsync);
+        _ = Task.Run(DebounceFlushLoopAsync);
+    }
 
-        while (total.Elapsed < MaxCollect)
+    public void EnqueueRaw(JobKind kind, IEnumerable<string> paths)
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (_debounceLock)
         {
-            var remaining = QuietPeriod - quiet.Elapsed;
-            if (remaining <= TimeSpan.Zero) break;
+            if (!_pending.TryGetValue(kind, out var bucket))
+            {
+                bucket = new PendingBucket(now);
+                _pending[kind] = bucket;
+            }
+            foreach (var p in paths)
+            {
+                if (!string.IsNullOrWhiteSpace(p))
+                    bucket.Paths.Add(p);
+            }
+            bucket.LastSeen = now;
+        }
+        BatchArrived?.Invoke();
+    }
 
-            using var server = new NamedPipeServerStream(pipeName, PipeDirection.In,
-                NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
-            using var cts = new CancellationTokenSource(remaining);
+    public void DecrementQueuedCount() => Interlocked.Decrement(ref _queuedCount);
+
+    public int DrainQueued()
+    {
+        int dropped = 0;
+        lock (_debounceLock) _pending.Clear();
+        while (_queue.Reader.TryRead(out _))
+        {
+            Interlocked.Decrement(ref _queuedCount);
+            dropped++;
+        }
+        return dropped;
+    }
+
+    public void StopAccepting()
+    {
+        try { _cts.Cancel(); } catch { }
+        _queue.Writer.TryComplete();
+    }
+
+    public void Dispose()
+    {
+        StopAccepting();
+        _cts.Dispose();
+    }
+
+    private async Task AcceptLoopAsync()
+    {
+        var ct = _cts.Token;
+        while (!ct.IsCancellationRequested)
+        {
+            NamedPipeServerStream? pipe = null;
             try
             {
-                server.WaitForConnectionAsync(cts.Token).GetAwaiter().GetResult();
-                using var reader = new StreamReader(server, new UTF8Encoding(false));
-                string? line;
-                while ((line = reader.ReadLine()) != null)
-                    if (line.Length > 0) paths.Add(line);
-                quiet.Restart();
+                pipe = new NamedPipeServerStream(
+                    _pipeName,
+                    PipeDirection.In,
+                    NamedPipeServerStream.MaxAllowedServerInstances,
+                    PipeTransmissionMode.Byte,
+                    PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+
+                await pipe.WaitForConnectionAsync(ct);
+                var connected = pipe;
+                pipe = null; // ownership transferred to reader task
+                _ = Task.Run(() => ReadClientAsync(connected), CancellationToken.None);
             }
-            catch (OperationCanceledException) { break; }
-            catch (IOException) { /* client vanished; keep listening */ }
+            catch (OperationCanceledException) { pipe?.Dispose(); break; }
+            catch (IOException) { pipe?.Dispose(); await Task.Delay(25, CancellationToken.None); }
+            catch { pipe?.Dispose(); await Task.Delay(50, CancellationToken.None); }
         }
-        return paths;
     }
 
-    private static bool TrySend(string pipeName, List<string> paths)
+    private async Task ReadClientAsync(NamedPipeServerStream pipe)
     {
         try
         {
-            using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.Out);
-            client.Connect(300);
-            using var writer = new StreamWriter(client, new UTF8Encoding(false));
-            foreach (var p in paths) writer.WriteLine(p);
-            writer.Flush();
-            return true;
+            await using (pipe)
+            using (var reader = new StreamReader(pipe, new UTF8Encoding(false)))
+            {
+                string? line;
+                while ((line = await reader.ReadLineAsync()) != null)
+                {
+                    var tab = line.IndexOf('\t');
+                    if (tab <= 0 || tab + 1 >= line.Length) continue;
+                    var verb = line[..tab];
+                    var path = line[(tab + 1)..];
+                    if (Program.TryParseVerb(verb, out var kind))
+                        EnqueueRaw(kind, new[] { path });
+                }
+            }
         }
-        catch (TimeoutException) { return false; }
-        catch (IOException) { return false; }
+        catch { /* follower disconnected early */ }
+    }
+
+    private async Task DebounceFlushLoopAsync()
+    {
+        var ct = _cts.Token;
+        while (!ct.IsCancellationRequested)
+        {
+            try { await Task.Delay(100, ct); }
+            catch (OperationCanceledException) { break; }
+
+            List<QueuedBatch>? ready = null;
+            var now = DateTimeOffset.UtcNow;
+            lock (_debounceLock)
+            {
+                if (_pending.Count > 0)
+                {
+                    foreach (var kv in _pending.ToList())
+                    {
+                        var b = kv.Value;
+                        if (now - b.LastSeen >= QuietPeriod || now - b.FirstSeen >= MaxCollect)
+                        {
+                            ready ??= new List<QueuedBatch>();
+                            ready.Add(new QueuedBatch(kv.Key, b.Paths));
+                            _pending.Remove(kv.Key);
+                        }
+                    }
+                }
+            }
+
+            if (ready != null)
+            {
+                foreach (var batch in ready)
+                {
+                    try
+                    {
+                        await _queue.Writer.WriteAsync(batch, ct);
+                        Interlocked.Increment(ref _queuedCount);
+                        BatchArrived?.Invoke();
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (ChannelClosedException) { break; }
+                }
+            }
+        }
+    }
+
+    private sealed class PendingBucket
+    {
+        public DateTimeOffset FirstSeen { get; }
+        public DateTimeOffset LastSeen { get; set; }
+        public List<string> Paths { get; } = new();
+
+        public PendingBucket(DateTimeOffset now)
+        {
+            FirstSeen = now;
+            LastSeen = now;
+        }
     }
 }
 

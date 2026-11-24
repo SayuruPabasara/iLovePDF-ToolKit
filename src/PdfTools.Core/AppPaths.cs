@@ -17,6 +17,7 @@ public static class AppPaths
     public static string SettingsFile => Path.Combine(DataDir, "settings.json");
     public static string CredentialFile => Path.Combine(DataDir, "credentials.dat");
     public static string TokenCacheFile => Path.Combine(DataDir, "token.cache");
+    public static string NoGainCacheFile => Path.Combine(DataDir, "nogain.cache");
 
     public static void EnsureDataDir() => Directory.CreateDirectory(DataDir);
 }

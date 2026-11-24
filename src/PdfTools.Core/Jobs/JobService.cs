@@ -13,7 +13,12 @@ public enum JobKind
     ImagesCombine   // N JPGs -> one PDF            (tool: imagepdf, merge_after)
 }
 
-public enum JobStatus { Success, NoGain, Failed }
+public enum JobStatus { Success, NoGain, Failed, Skipped }
+
+/// <param name="Completed">Units completed so far.</param>
+/// <param name="Total">Total units in this batch.</param>
+/// <param name="CurrentFile">Display filename currently being processed.</param>
+public sealed record JobProgress(int Completed, int Total, string CurrentFile);
 
 /// <param name="Inputs">Full paths of the files this result is about.</param>
 /// <param name="OutputPath">Saved file (null when nothing was saved).</param>
@@ -33,14 +38,29 @@ public sealed class JobService
     private readonly Func<ILoveApiClient> _clientFactory;
     private readonly AppSettings _settings;
     private readonly IJobLog _log;
+    private readonly InFlightJobTracker _inFlight;
+    private readonly INoGainCache _noGainCache;
+    private readonly TimeProvider _time;
+    private readonly bool _disposeClient;
 
     public int? LastRemainingCredits { get; private set; }
 
-    public JobService(Func<ILoveApiClient> clientFactory, AppSettings settings, IJobLog? log = null)
+    public JobService(
+        Func<ILoveApiClient> clientFactory,
+        AppSettings settings,
+        IJobLog? log = null,
+        InFlightJobTracker? inFlight = null,
+        INoGainCache? noGainCache = null,
+        TimeProvider? timeProvider = null,
+        bool disposeClient = true)
     {
         _clientFactory = clientFactory;
         _settings = settings;
         _log = log ?? new NullJobLog();
+        _inFlight = inFlight ?? new InFlightJobTracker();
+        _noGainCache = noGainCache ?? FileNoGainCache.Shared;
+        _time = timeProvider ?? TimeProvider.System;
+        _disposeClient = disposeClient;
     }
 
     public static string OperationName(JobKind k) => k switch
@@ -53,7 +73,11 @@ public sealed class JobService
         _ => k.ToString()
     };
 
-    public async Task<IReadOnlyList<JobItemResult>> RunAsync(JobKind kind, IReadOnlyList<string> files, CancellationToken ct = default)
+    public async Task<IReadOnlyList<JobItemResult>> RunAsync(
+        JobKind kind,
+        IReadOnlyList<string> files,
+        CancellationToken ct = default,
+        IProgress<JobProgress>? progress = null)
     {
         var results = new List<JobItemResult>();
         var valid = new List<string>();
@@ -119,18 +143,41 @@ public sealed class JobService
                 break;
         }
 
-        using var client = _clientFactory();
-        using var gate = new SemaphoreSlim(MaxParallel);
-        var tasks = units.Select(async u =>
+        var client = _clientFactory();
+        try
         {
-            await gate.WaitAsync(ct);
-            try { return await ExecuteAsync(u, client, ct); }
-            finally { gate.Release(); }
-        }).ToList();
+            using var gate = new SemaphoreSlim(MaxParallel);
+            int completed = 0;
+            int total = units.Count;
+            var tasks = units.Select(async u =>
+            {
+                try
+                {
+                    await gate.WaitAsync(ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    return Fail(u.Kind, u.Inputs, "Cancelled.", 0);
+                }
+                try
+                {
+                    progress?.Report(new JobProgress(Volatile.Read(ref completed), total, Path.GetFileName(u.Inputs[0])));
+                    var item = await ExecuteAsync(u, client, ct);
+                    var done = Interlocked.Increment(ref completed);
+                    progress?.Report(new JobProgress(done, total, Path.GetFileName(u.Inputs[0])));
+                    return item;
+                }
+                finally { gate.Release(); }
+            }).ToList();
 
-        results.AddRange(await Task.WhenAll(tasks));
-        LastRemainingCredits = client.RemainingCredits;
-        return results;
+            results.AddRange(await Task.WhenAll(tasks));
+            LastRemainingCredits = client.RemainingCredits;
+            return results;
+        }
+        finally
+        {
+            if (_disposeClient) client.Dispose();
+        }
     }
 
     // ------------------------------------------------------------------ one unit of work
@@ -157,6 +204,23 @@ public sealed class JobService
         var first = u.Inputs[0];
         var dir = Path.GetDirectoryName(first)!;
         var baseName = Path.GetFileNameWithoutExtension(first) + u.Suffix;
+        var fingerprint = JobIdempotency.ComputeFingerprint(u.Kind, u.Inputs, _settings);
+
+        using var lease = _inFlight.TryEnter(fingerprint);
+        if (lease == null)
+        {
+            var dupMsg = $"{Path.GetFileName(first)} is already being processed.";
+            Log(u, null, "Skipped", dupMsg, sw);
+            return new JobItemResult(u.Inputs, null, JobStatus.Skipped, dupMsg);
+        }
+
+        if (u.RequireSmaller && _noGainCache.Contains(fingerprint, _time.GetUtcNow()))
+        {
+            var cachedMsg = $"{Path.GetFileName(first)} is already well compressed (cached); no API credit used.";
+            Log(u, null, "NoGain", cachedMsg, sw);
+            return new JobItemResult(u.Inputs, null, JobStatus.NoGain, cachedMsg);
+        }
+
         string? temp = null, extracted = null;
         ApiTask? task = null;
 
@@ -189,6 +253,7 @@ public sealed class JobService
                 var inLen = new FileInfo(first).Length;
                 if (outLen >= inLen)
                 {
+                    _noGainCache.Record(fingerprint, _time.GetUtcNow().AddDays(30));
                     var msg = $"{Path.GetFileName(first)} is already well compressed; no smaller file was produced.";
                     Log(u, null, "NoGain", msg, sw);
                     return new JobItemResult(u.Inputs, null, JobStatus.NoGain, msg);

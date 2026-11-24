@@ -188,3 +188,4 @@ public class CachingAndTransferTests : IDisposable
         Assert.Equal(ApiErrorKind.Rejected, ex.Kind);
     }
 }
+

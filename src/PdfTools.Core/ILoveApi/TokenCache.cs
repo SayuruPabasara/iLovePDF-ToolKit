@@ -133,3 +133,4 @@ public sealed class DpapiTokenCache : ITokenCache
         catch (IOException) { }
     }
 }
+
