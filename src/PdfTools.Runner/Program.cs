@@ -6,6 +6,7 @@ using System.Windows.Forms;
 using PdfTools.Core;
 using PdfTools.Core.ILoveApi;
 using PdfTools.Core.Jobs;
+using PdfTools.Core.Observability;
 
 namespace PdfTools.Runner;
 
@@ -214,8 +215,8 @@ internal sealed class RunnerServer : IDisposable
                 _ = Task.Run(() => ReadClientAsync(connected), CancellationToken.None);
             }
             catch (OperationCanceledException) { pipe?.Dispose(); break; }
-            catch (IOException) { pipe?.Dispose(); await Task.Delay(25, CancellationToken.None); }
-            catch { pipe?.Dispose(); await Task.Delay(50, CancellationToken.None); }
+            catch (IOException ex) { pipe?.Dispose(); DiagnosticsLog.Write("RunnerServer", "Pipe accept I/O error", ex); await Task.Delay(25, CancellationToken.None); }
+            catch (Exception ex) { pipe?.Dispose(); DiagnosticsLog.Write("RunnerServer", "Pipe accept error", ex); await Task.Delay(50, CancellationToken.None); }
         }
     }
 
@@ -309,7 +310,7 @@ internal static class Shell
             if (!File.Exists(exe)) return;
             Process.Start(new ProcessStartInfo(exe, arg ?? "") { UseShellExecute = false });
         }
-        catch { }
+        catch (Exception ex) { DiagnosticsLog.Write("Shell", "Failed to launch PdfToolsSettings", ex); }
     }
 
     public static void Reveal(string path)
@@ -319,7 +320,7 @@ internal static class Shell
             if (File.Exists(path))
                 Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true });
         }
-        catch { }
+        catch (Exception ex) { DiagnosticsLog.Write("Shell", "Failed to reveal output in Explorer", ex); }
     }
 }
 

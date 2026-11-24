@@ -1,4 +1,5 @@
 using PdfTools.Core.ILoveApi;
+using PdfTools.Core.Observability;
 
 namespace PdfTools.Core.Resilience;
 
@@ -110,7 +111,11 @@ public sealed class CircuitBreaker
 
             if (_state == CircuitState.HalfOpen || _consecutiveFailures >= _failureThreshold)
             {
-                if (_state != CircuitState.Open) _tripCount++;
+                if (_state != CircuitState.Open)
+                {
+                    _tripCount++;
+                    Telemetry.CircuitTrips.Add(1, new KeyValuePair<string, object?>("kind", kind.ToString()));
+                }
                 _state = CircuitState.Open;
                 _openUntil = _time.GetUtcNow() + _breakDuration;
                 _tripKind = ApiErrorKind.CircuitOpen;
@@ -129,7 +134,11 @@ public sealed class CircuitBreaker
 
         lock (_lock)
         {
-            if (!_terminalTrip) _tripCount++;
+            if (!_terminalTrip)
+            {
+                _tripCount++;
+                Telemetry.CircuitTrips.Add(1, new KeyValuePair<string, object?>("kind", kind.ToString()));
+            }
             _terminalTrip = true;
             _state = CircuitState.Open;
             _halfOpenProbeInFlight = false;

@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO.Compression;
 using PdfTools.Core.ILoveApi;
+using PdfTools.Core.Observability;
 
 namespace PdfTools.Core.Jobs;
 
@@ -97,7 +98,7 @@ public sealed class JobService
                 problem = dirErr;
             }
 
-            if (problem != null) results.Add(Fail(kind, new[] { f }, problem, 0));
+            if (problem != null) results.Add(Fail(kind, new[] { f }, problem, 0, failedStage: "Preflight", errorKind: "Validation"));
             else valid.Add(f);
         }
         if (valid.Count == 0) return results;
@@ -112,7 +113,7 @@ public sealed class JobService
                 {
                     results.Add(Fail(kind, valid, kind == JobKind.Merge
                         ? "Select at least two PDF files to merge."
-                        : "Select at least two JPG files to combine.", 0));
+                        : "Select at least two JPG files to combine.", 0, failedStage: "Preflight", errorKind: "Validation"));
                     return results;
                 }
                 valid.Sort(NaturalComparer.Instance);     // Explorer order = predictable page order
@@ -157,7 +158,7 @@ public sealed class JobService
                 }
                 catch (OperationCanceledException)
                 {
-                    return Fail(u.Kind, u.Inputs, "Cancelled.", 0);
+                    return Fail(u.Kind, u.Inputs, "Cancelled.", 0, failedStage: "Queue", errorKind: "Cancelled");
                 }
                 try
                 {
@@ -201,23 +202,29 @@ public sealed class JobService
     private async Task<JobItemResult> ExecuteAsync(WorkUnit u, ILoveApiClient client, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
+        var correlationId = Guid.NewGuid().ToString("N")[..12];
         var first = u.Inputs[0];
         var dir = Path.GetDirectoryName(first)!;
         var baseName = Path.GetFileNameWithoutExtension(first) + u.Suffix;
+        var inputBytes = SumInputBytes(u.Inputs);
         var fingerprint = JobIdempotency.ComputeFingerprint(u.Kind, u.Inputs, _settings);
+
+        using var span = Telemetry.StartSpan("job.unit", correlationId);
+        span?.SetTag("pdftools.operation", OperationName(u.Kind));
+        using var trace = ILoveApiClient.BeginTrace(correlationId);
 
         using var lease = _inFlight.TryEnter(fingerprint);
         if (lease == null)
         {
             var dupMsg = $"{Path.GetFileName(first)} is already being processed.";
-            Log(u, null, "Skipped", dupMsg, sw);
+            Log(u, null, "Skipped", dupMsg, sw, trace, inputBytes, null);
             return new JobItemResult(u.Inputs, null, JobStatus.Skipped, dupMsg);
         }
 
         if (u.RequireSmaller && _noGainCache.Contains(fingerprint, _time.GetUtcNow()))
         {
             var cachedMsg = $"{Path.GetFileName(first)} is already well compressed (cached); no API credit used.";
-            Log(u, null, "NoGain", cachedMsg, sw);
+            Log(u, null, "NoGain", cachedMsg, sw, trace, inputBytes, null);
             return new JobItemResult(u.Inputs, null, JobStatus.NoGain, cachedMsg);
         }
 
@@ -241,12 +248,12 @@ public sealed class JobService
             {
                 extracted = Path.Combine(dir, $".pdftools-{Guid.NewGuid():N}.tmp");
                 if (!ExtractFirstPdf(temp, extracted))
-                    throw new ApiException(ApiErrorKind.Rejected, "iLoveAPI returned no PDF file.");
+                    throw new ApiException(ApiErrorKind.Rejected, "iLoveAPI returned no PDF file.", stage: ApiStage.Download, server: task.Server, taskId: task.Task);
                 pdfFile = extracted;
             }
 
             var outLen = new FileInfo(pdfFile).Length;
-            if (outLen == 0) throw new ApiException(ApiErrorKind.Rejected, "iLoveAPI returned an empty file.");
+            if (outLen == 0) throw new ApiException(ApiErrorKind.Rejected, "iLoveAPI returned an empty file.", stage: ApiStage.Download, server: task.Server, taskId: task.Task);
 
             if (u.RequireSmaller)
             {
@@ -255,7 +262,7 @@ public sealed class JobService
                 {
                     _noGainCache.Record(fingerprint, _time.GetUtcNow().AddDays(30));
                     var msg = $"{Path.GetFileName(first)} is already well compressed; no smaller file was produced.";
-                    Log(u, null, "NoGain", msg, sw);
+                    Log(u, null, "NoGain", msg, sw, trace, inputBytes, outLen);
                     return new JobItemResult(u.Inputs, null, JobStatus.NoGain, msg);
                 }
             }
@@ -264,35 +271,41 @@ public sealed class JobService
             if (pdfFile == extracted) extracted = null; else temp = null;   // moved
 
             string detail = Path.GetFileName(finalPath);
+            var outLen2 = new FileInfo(finalPath).Length;
             if (u.RequireSmaller)
             {
                 var inLen = new FileInfo(first).Length;
-                var outLen2 = new FileInfo(finalPath).Length;
                 var pct = (int)Math.Round(100.0 * (inLen - outLen2) / inLen);
                 detail += $" ({OutputNaming.FormatSize(inLen)} \u2192 {OutputNaming.FormatSize(outLen2)}, {pct}% smaller)";
+                if (inLen > outLen2) Telemetry.BytesSaved.Add(inLen - outLen2);
             }
-            Log(u, finalPath, "Success", null, sw);
+            Log(u, finalPath, "Success", null, sw, trace, inputBytes, outLen2);
             return new JobItemResult(u.Inputs, finalPath, JobStatus.Success, detail);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            return Fail(u.Kind, u.Inputs, "Cancelled.", sw.Elapsed.TotalSeconds);
+            return Fail(u.Kind, u.Inputs, "Cancelled.", sw.Elapsed.TotalSeconds, trace, inputBytes, failedStage: "Cancelled", errorKind: "Cancelled");
         }
         catch (ApiException ex)
         {
-            return Fail(u.Kind, u.Inputs, ex.Message, sw.Elapsed.TotalSeconds);
+            return Fail(u.Kind, u.Inputs, ex.Message, sw.Elapsed.TotalSeconds, trace, inputBytes,
+                failedStage: ex.Stage?.ToString(), errorKind: ex.Kind.ToString(), httpStatus: ex.StatusCode,
+                apiServer: ex.Server, apiTaskId: ex.TaskId);
         }
         catch (IOException ex)
         {
-            return Fail(u.Kind, u.Inputs, "File error: " + ex.Message, sw.Elapsed.TotalSeconds);
+            DiagnosticsLog.Write("JobService", "File I/O error during job", ex, correlationId);
+            return Fail(u.Kind, u.Inputs, "File error: " + ex.Message, sw.Elapsed.TotalSeconds, trace, inputBytes, failedStage: "Save", errorKind: "IO");
         }
         catch (UnauthorizedAccessException ex)
         {
-            return Fail(u.Kind, u.Inputs, "Access denied: " + ex.Message, sw.Elapsed.TotalSeconds);
+            DiagnosticsLog.Write("JobService", "Access denied during job", ex, correlationId);
+            return Fail(u.Kind, u.Inputs, "Access denied: " + ex.Message, sw.Elapsed.TotalSeconds, trace, inputBytes, failedStage: "Save", errorKind: "AccessDenied");
         }
         catch (Exception ex)
         {
-            return Fail(u.Kind, u.Inputs, "Unexpected error: " + ex.Message, sw.Elapsed.TotalSeconds);
+            DiagnosticsLog.Write("JobService", "Unexpected error during job", ex, correlationId);
+            return Fail(u.Kind, u.Inputs, "Unexpected error: " + ex.Message, sw.Elapsed.TotalSeconds, trace, inputBytes, failedStage: "Unknown", errorKind: "Unexpected");
         }
         finally
         {
@@ -336,17 +349,87 @@ public sealed class JobService
         return uploaded;
     }
 
-    private JobItemResult Fail(JobKind kind, IReadOnlyList<string> inputs, string message, double seconds)
+    private static long? SumInputBytes(IReadOnlyList<string> inputs)
     {
-        _log.Write(new LogEntry(DateTimeOffset.Now, OperationName(kind),
-            inputs.Select(Path.GetFileName).Select(n => n ?? "").ToArray(), null, "Failed", message, Math.Round(seconds, 1)));
+        long total = 0;
+        foreach (var p in inputs)
+        {
+            try { total += new FileInfo(p).Length; } catch { return null; }
+        }
+        return total;
+    }
+
+    private JobItemResult Fail(
+        JobKind kind,
+        IReadOnlyList<string> inputs,
+        string message,
+        double seconds,
+        ApiCallTrace? trace = null,
+        long? inputBytes = null,
+        string? failedStage = null,
+        string? errorKind = null,
+        int? httpStatus = null,
+        string? apiServer = null,
+        string? apiTaskId = null)
+    {
+        var op = OperationName(kind);
+        Telemetry.JobsTotal.Add(1, new KeyValuePair<string, object?>("operation", op), new KeyValuePair<string, object?>("status", "Failed"));
+        Telemetry.JobDurationMs.Record(seconds * 1000.0, new KeyValuePair<string, object?>("operation", op));
+
+        _log.Write(new LogEntry(
+            DateTimeOffset.Now,
+            op,
+            inputs.Select(Path.GetFileName).Select(n => n ?? "").ToArray(),
+            null,
+            "Failed",
+            message,
+            Math.Round(seconds, 1),
+            CorrelationId: trace?.CorrelationId,
+            ApiTaskId: apiTaskId ?? trace?.ApiTaskId,
+            ApiServer: apiServer ?? trace?.ApiServer,
+            FailedStage: failedStage,
+            ErrorKind: errorKind,
+            HttpStatus: httpStatus,
+            RetryCount: trace?.Retries is > 0 ? trace.Retries : null,
+            InputBytes: inputBytes,
+            OutputBytes: null,
+            Timings: trace?.ToStageTimings()));
         return new JobItemResult(inputs, null, JobStatus.Failed, message);
     }
 
-    private void Log(WorkUnit u, string? output, string status, string? message, Stopwatch sw) =>
-        _log.Write(new LogEntry(DateTimeOffset.Now, OperationName(u.Kind),
+    private void Log(
+        WorkUnit u,
+        string? output,
+        string status,
+        string? message,
+        Stopwatch sw,
+        ApiCallTrace trace,
+        long? inputBytes,
+        long? outputBytes)
+    {
+        var op = OperationName(u.Kind);
+        Telemetry.JobsTotal.Add(1, new KeyValuePair<string, object?>("operation", op), new KeyValuePair<string, object?>("status", status));
+        Telemetry.JobDurationMs.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("operation", op));
+
+        _log.Write(new LogEntry(
+            DateTimeOffset.Now,
+            op,
             u.Inputs.Select(Path.GetFileName).Select(n => n ?? "").ToArray(),
-            output == null ? null : Path.GetFileName(output), status, message, Math.Round(sw.Elapsed.TotalSeconds, 1)));
+            output == null ? null : Path.GetFileName(output),
+            status,
+            message,
+            Math.Round(sw.Elapsed.TotalSeconds, 1),
+            CorrelationId: trace.CorrelationId,
+            ApiTaskId: trace.ApiTaskId,
+            ApiServer: trace.ApiServer,
+            FailedStage: null,
+            ErrorKind: null,
+            HttpStatus: null,
+            RetryCount: trace.Retries > 0 ? trace.Retries : null,
+            InputBytes: inputBytes,
+            OutputBytes: outputBytes,
+            Timings: trace.ToStageTimings()));
+    }
 
     private static bool LooksLikeZip(string path)
     {

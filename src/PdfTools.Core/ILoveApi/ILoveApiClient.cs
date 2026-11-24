@@ -1,10 +1,88 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using PdfTools.Core.Observability;
 using PdfTools.Core.Resilience;
 
 namespace PdfTools.Core.ILoveApi;
+
+/// <summary>
+/// Per-work-unit async-local trace collecting stage latencies, server/task metadata, and retry counts
+/// safely across concurrent operations sharing a single <see cref="ILoveApiClient"/>.
+/// </summary>
+public sealed class ApiCallTrace : IDisposable
+{
+    private readonly ApiCallTrace? _previous;
+    private readonly Action<ApiCallTrace?> _restore;
+    private int _authMs = -1;
+    private int _startMs = -1;
+    private int _uploadMs = -1;
+    private int _processMs = -1;
+    private int _downloadMs = -1;
+    private int _retries;
+    private int _disposed;
+
+    public string CorrelationId { get; }
+    public string? ApiTaskId { get; internal set; }
+    public string? ApiServer { get; internal set; }
+    public int Retries => Volatile.Read(ref _retries);
+
+    internal ApiCallTrace(string correlationId, ApiCallTrace? previous, Action<ApiCallTrace?> restore)
+    {
+        CorrelationId = correlationId;
+        _previous = previous;
+        _restore = restore;
+    }
+
+    internal void RecordStageMs(ApiStage stage, int elapsedMs)
+    {
+        elapsedMs = Math.Max(0, elapsedMs);
+        switch (stage)
+        {
+            case ApiStage.Auth: AddStage(ref _authMs, elapsedMs); break;
+            case ApiStage.Start: AddStage(ref _startMs, elapsedMs); break;
+            case ApiStage.Upload: AddStage(ref _uploadMs, elapsedMs); break;
+            case ApiStage.Process: AddStage(ref _processMs, elapsedMs); break;
+            case ApiStage.Download: AddStage(ref _downloadMs, elapsedMs); break;
+        }
+    }
+
+    internal void RecordRetry() => Interlocked.Increment(ref _retries);
+
+    public StageTimings? ToStageTimings()
+    {
+        int? a = ReadStage(ref _authMs);
+        int? s = ReadStage(ref _startMs);
+        int? u = ReadStage(ref _uploadMs);
+        int? p = ReadStage(ref _processMs);
+        int? d = ReadStage(ref _downloadMs);
+        return (a ?? s ?? u ?? p ?? d) == null ? null : new StageTimings(a, s, u, p, d);
+    }
+
+    private static void AddStage(ref int field, int delta)
+    {
+        while (true)
+        {
+            int cur = Volatile.Read(ref field);
+            int next = cur < 0 ? delta : cur + delta;
+            if (Interlocked.CompareExchange(ref field, next, cur) == cur) return;
+        }
+    }
+
+    private static int? ReadStage(ref int field)
+    {
+        int v = Volatile.Read(ref field);
+        return v < 0 ? null : v;
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            _restore(_previous);
+    }
+}
 
 /// <summary>
 /// Minimal client for the iLoveAPI REST workflow: auth -> start -> upload -> process -> download (-> delete).
@@ -14,6 +92,7 @@ namespace PdfTools.Core.ILoveApi;
 public sealed class ILoveApiClient : IDisposable
 {
     public static readonly Uri DefaultApiBase = new("https://api.ilovepdf.com/v1/");
+    private static readonly AsyncLocal<ApiCallTrace?> CurrentTrace = new();
 
     private readonly HttpClient _http;
     private readonly bool _ownsHttp;
@@ -47,6 +126,15 @@ public sealed class ILoveApiClient : IDisposable
 
     /// <summary>Number of /auth network requests issued by this client (0 when served from token cache).</summary>
     public int AuthNetworkCalls => Volatile.Read(ref _authNetworkCalls);
+
+    /// <summary>Begins an async-local trace scope for capturing per-stage timings and retries.</summary>
+    public static ApiCallTrace BeginTrace(string correlationId)
+    {
+        var prev = CurrentTrace.Value;
+        var trace = new ApiCallTrace(correlationId, prev, p => CurrentTrace.Value = p);
+        CurrentTrace.Value = trace;
+        return trace;
+    }
 
     public ILoveApiClient(
         string publicKey,
@@ -112,13 +200,19 @@ public sealed class ILoveApiClient : IDisposable
         await _tokenLock.WaitAsync(ct);
         try
         {
+            var trace = CurrentTrace.Value;
             var now = _time.GetUtcNow();
-            if (!force && _token != null && now < _tokenExpires) return _token;
+            if (!force && _token != null && now < _tokenExpires)
+            {
+                trace?.RecordStageMs(ApiStage.Auth, 0);
+                return _token;
+            }
 
             if (!force && _tokenCache.TryGet(_tokenCacheKey, now, out var cachedToken, out var cachedExp))
             {
                 _token = cachedToken;
                 _tokenExpires = cachedExp;
+                trace?.RecordStageMs(ApiStage.Auth, 0);
                 return cachedToken;
             }
 
@@ -128,42 +222,51 @@ public sealed class ILoveApiClient : IDisposable
                 _tokenCache.Clear();
             }
 
-            Interlocked.Increment(ref _authNetworkCalls);
-            var uri = new Uri(_apiBase, "auth");
-            // Form-encoded first (what the official libraries send); JSON as fallback.
-            using var res = await SendAsync(() => new HttpRequestMessage(HttpMethod.Post, uri)
-            {
-                Content = new FormUrlEncodedContent(new[] { new KeyValuePair<string, string>("public_key", _publicKey) })
-            }, ApiStage.Auth, _resilience.AuthAndStartTimeout, server: _apiBase.Host, taskId: null, ct, authorize: false);
-
-            HttpResponseMessage final = res;
-            HttpResponseMessage? second = null;
-            if (res.StatusCode is HttpStatusCode.UnsupportedMediaType or HttpStatusCode.BadRequest)
-            {
-                second = await SendAsync(() => new HttpRequestMessage(HttpMethod.Post, uri)
-                {
-                    Content = new StringContent(JsonSerializer.Serialize(new { public_key = _publicKey }), Encoding.UTF8, "application/json")
-                }, ApiStage.Auth, _resilience.AuthAndStartTimeout, server: _apiBase.Host, taskId: null, ct, authorize: false);
-                final = second;
-            }
-
+            using var span = Telemetry.StartSpan("api.auth", trace?.CorrelationId, ActivityKind.Client);
+            var sw = Stopwatch.StartNew();
             try
             {
-                var json = await ReadJsonAsync(final, ApiStage.Auth, _apiBase.Host, null, ct, authContext: true);
-                var token = json.TryGetProperty("token", out var t) ? t.GetString() : null;
-                if (string.IsNullOrEmpty(token))
+                Interlocked.Increment(ref _authNetworkCalls);
+                var uri = new Uri(_apiBase, "auth");
+                // Form-encoded first (what the official libraries send); JSON as fallback.
+                using var res = await SendAsync(() => new HttpRequestMessage(HttpMethod.Post, uri)
                 {
-                    var ex = new ApiException(ApiErrorKind.Auth, "iLoveAPI did not return a token. Check your API key.",
-                        stage: ApiStage.Auth, server: _apiBase.Host);
-                    CircuitBreaker.TripTerminal(ex.Kind, ex.Message);
-                    throw ex;
+                    Content = new FormUrlEncodedContent(new[] { new KeyValuePair<string, string>("public_key", _publicKey) })
+                }, ApiStage.Auth, _resilience.AuthAndStartTimeout, server: _apiBase.Host, taskId: null, ct, authorize: false);
+
+                HttpResponseMessage final = res;
+                HttpResponseMessage? second = null;
+                if (res.StatusCode is HttpStatusCode.UnsupportedMediaType or HttpStatusCode.BadRequest)
+                {
+                    second = await SendAsync(() => new HttpRequestMessage(HttpMethod.Post, uri)
+                    {
+                        Content = new StringContent(JsonSerializer.Serialize(new { public_key = _publicKey }), Encoding.UTF8, "application/json")
+                    }, ApiStage.Auth, _resilience.AuthAndStartTimeout, server: _apiBase.Host, taskId: null, ct, authorize: false);
+                    final = second;
                 }
-                _token = token;
-                _tokenExpires = _time.GetUtcNow().AddMinutes(50);   // tokens live 1 hour
-                _tokenCache.Set(_tokenCacheKey, token, _tokenExpires);
-                return token;
+
+                try
+                {
+                    var json = await ReadJsonAsync(final, ApiStage.Auth, _apiBase.Host, null, ct, authContext: true);
+                    var token = json.TryGetProperty("token", out var t) ? t.GetString() : null;
+                    if (string.IsNullOrEmpty(token))
+                    {
+                        var ex = new ApiException(ApiErrorKind.Auth, "iLoveAPI did not return a token. Check your API key.",
+                            stage: ApiStage.Auth, server: _apiBase.Host);
+                        CircuitBreaker.TripTerminal(ex.Kind, ex.Message);
+                        throw ex;
+                    }
+                    _token = token;
+                    _tokenExpires = _time.GetUtcNow().AddMinutes(50);   // tokens live 1 hour
+                    _tokenCache.Set(_tokenCacheKey, token, _tokenExpires);
+                    return token;
+                }
+                finally { second?.Dispose(); }
             }
-            finally { second?.Dispose(); }
+            finally
+            {
+                trace?.RecordStageMs(ApiStage.Auth, (int)sw.ElapsedMilliseconds);
+            }
         }
         finally { _tokenLock.Release(); }
     }
@@ -172,166 +275,219 @@ public sealed class ILoveApiClient : IDisposable
 
     public async Task<ApiTask> StartAsync(string tool, CancellationToken ct = default)
     {
-        var path = _region.Length > 0 ? $"start/{tool}/{_region}" : $"start/{tool}";
-        using var res = await SendAsync(
-            () => new HttpRequestMessage(HttpMethod.Get, new Uri(_apiBase, path)),
-            ApiStage.Start, _resilience.AuthAndStartTimeout, server: _apiBase.Host, taskId: null, ct);
+        var trace = CurrentTrace.Value;
+        using var span = Telemetry.StartSpan("api.start", trace?.CorrelationId, ActivityKind.Client);
+        span?.SetTag("pdftools.tool", tool);
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var path = _region.Length > 0 ? $"start/{tool}/{_region}" : $"start/{tool}";
+            using var res = await SendAsync(
+                () => new HttpRequestMessage(HttpMethod.Get, new Uri(_apiBase, path)),
+                ApiStage.Start, _resilience.AuthAndStartTimeout, server: _apiBase.Host, taskId: null, ct);
 
-        var json = await ReadJsonAsync(res, ApiStage.Start, _apiBase.Host, null, ct);
-        var server = json.TryGetProperty("server", out var s) ? s.GetString() : null;
-        var task = json.TryGetProperty("task", out var t) ? t.GetString() : null;
-        if (string.IsNullOrEmpty(server) || string.IsNullOrEmpty(task))
-            throw new ApiException(ApiErrorKind.Rejected, "iLoveAPI returned an unexpected response when starting the task.",
-                stage: ApiStage.Start, server: _apiBase.Host);
-        if (json.TryGetProperty("remaining_credits", out var rc) && rc.ValueKind == JsonValueKind.Number && rc.TryGetInt32(out var credits))
-            RemainingCredits = credits;
-        return new ApiTask(server!, task!);
+            var json = await ReadJsonAsync(res, ApiStage.Start, _apiBase.Host, null, ct);
+            var server = json.TryGetProperty("server", out var s) ? s.GetString() : null;
+            var task = json.TryGetProperty("task", out var t) ? t.GetString() : null;
+            if (string.IsNullOrEmpty(server) || string.IsNullOrEmpty(task))
+                throw new ApiException(ApiErrorKind.Rejected, "iLoveAPI returned an unexpected response when starting the task.",
+                    stage: ApiStage.Start, server: _apiBase.Host);
+            if (json.TryGetProperty("remaining_credits", out var rc) && rc.ValueKind == JsonValueKind.Number && rc.TryGetInt32(out var credits))
+                RemainingCredits = credits;
+            if (trace != null)
+            {
+                trace.ApiServer = server;
+                trace.ApiTaskId = task;
+            }
+            span?.SetTag("pdftools.server", server);
+            return new ApiTask(server!, task!);
+        }
+        finally
+        {
+            trace?.RecordStageMs(ApiStage.Start, (int)sw.ElapsedMilliseconds);
+        }
     }
 
     /// <summary>Uploads one local file; returns the server-side file name to use in <see cref="ProcessAsync"/>.</summary>
     public async Task<string> UploadAsync(ApiTask task, string localPath, CancellationToken ct = default)
     {
-        var uri = new Uri(_serverBase(task.Server), "upload");
-        // The visible name is sent in /process; keep the multipart name ASCII-safe.
-        var safeName = "upload" + Path.GetExtension(localPath);
-
-        using var res = await SendAsync(() =>
+        var trace = CurrentTrace.Value;
+        using var span = Telemetry.StartSpan("api.upload", trace?.CorrelationId, ActivityKind.Client);
+        span?.SetTag("pdftools.server", task.Server);
+        var sw = Stopwatch.StartNew();
+        try
         {
-            var form = new MultipartFormDataContent();
-            form.Add(new StringContent(task.Task), "task");
-            var file = new StreamContent(new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true));
-            file.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-            form.Add(file, "file", safeName);
-            return new HttpRequestMessage(HttpMethod.Post, uri) { Content = form };
-        }, ApiStage.Upload, _resilience.TransferTimeout, server: task.Server, taskId: task.Task, ct);
+            var uri = new Uri(_serverBase(task.Server), "upload");
+            // The visible name is sent in /process; keep the multipart name ASCII-safe.
+            var safeName = "upload" + Path.GetExtension(localPath);
 
-        var json = await ReadJsonAsync(res, ApiStage.Upload, task.Server, task.Task, ct);
-        var name = json.TryGetProperty("server_filename", out var s) ? s.GetString() : null;
-        if (string.IsNullOrEmpty(name))
-            throw new ApiException(ApiErrorKind.Rejected, "iLoveAPI did not accept the uploaded file.",
-                stage: ApiStage.Upload, server: task.Server, taskId: task.Task);
-        return name!;
+            using var res = await SendAsync(() =>
+            {
+                var form = new MultipartFormDataContent();
+                form.Add(new StringContent(task.Task), "task");
+                var file = new StreamContent(new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true));
+                file.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                form.Add(file, "file", safeName);
+                return new HttpRequestMessage(HttpMethod.Post, uri) { Content = form };
+            }, ApiStage.Upload, _resilience.TransferTimeout, server: task.Server, taskId: task.Task, ct);
+
+            var json = await ReadJsonAsync(res, ApiStage.Upload, task.Server, task.Task, ct);
+            var name = json.TryGetProperty("server_filename", out var s) ? s.GetString() : null;
+            if (string.IsNullOrEmpty(name))
+                throw new ApiException(ApiErrorKind.Rejected, "iLoveAPI did not accept the uploaded file.",
+                    stage: ApiStage.Upload, server: task.Server, taskId: task.Task);
+            return name!;
+        }
+        finally
+        {
+            trace?.RecordStageMs(ApiStage.Upload, (int)sw.ElapsedMilliseconds);
+        }
     }
 
     public async Task<ProcessResult> ProcessAsync(ApiTask task, string tool, IReadOnlyList<UploadedFile> files,
                                                   IDictionary<string, object?>? extra = null, CancellationToken ct = default)
     {
-        var body = new Dictionary<string, object?>
+        var trace = CurrentTrace.Value;
+        using var span = Telemetry.StartSpan("api.process", trace?.CorrelationId, ActivityKind.Client);
+        span?.SetTag("pdftools.server", task.Server);
+        span?.SetTag("pdftools.tool", tool);
+        var sw = Stopwatch.StartNew();
+        try
         {
-            ["task"] = task.Task,
-            ["tool"] = tool,
-            ["files"] = files.Select(f => new Dictionary<string, object?>
+            var body = new Dictionary<string, object?>
             {
-                ["server_filename"] = f.ServerFilename,
-                ["filename"] = f.Filename
-            }).ToList(),
-            ["ignore_errors"] = false      // fail loudly instead of silently dropping a damaged file
-        };
-        if (extra != null) foreach (var kv in extra) body[kv.Key] = kv.Value;
+                ["task"] = task.Task,
+                ["tool"] = tool,
+                ["files"] = files.Select(f => new Dictionary<string, object?>
+                {
+                    ["server_filename"] = f.ServerFilename,
+                    ["filename"] = f.Filename
+                }).ToList(),
+                ["ignore_errors"] = false      // fail loudly instead of silently dropping a damaged file
+            };
+            if (extra != null) foreach (var kv in extra) body[kv.Key] = kv.Value;
 
-        var uri = new Uri(_serverBase(task.Server), "process");
-        var payload = JsonSerializer.Serialize(body);
-        using var res = await SendAsync(() => new HttpRequestMessage(HttpMethod.Post, uri)
+            var uri = new Uri(_serverBase(task.Server), "process");
+            var payload = JsonSerializer.Serialize(body);
+            using var res = await SendAsync(() => new HttpRequestMessage(HttpMethod.Post, uri)
+            {
+                Content = new StringContent(payload, Encoding.UTF8, "application/json")
+            }, ApiStage.Process, _resilience.ProcessTimeout, server: task.Server, taskId: task.Task, ct);
+
+            var json = await ReadJsonAsync(res, ApiStage.Process, task.Server, task.Task, ct);
+            var status = json.TryGetProperty("status", out var st) ? st.GetString() ?? "" : "";
+            if (!status.StartsWith("TaskSuccess", StringComparison.Ordinal))
+                throw new ApiException(ApiErrorKind.Rejected, $"iLoveAPI could not process the file (status: {(status.Length == 0 ? "unknown" : status)}).",
+                    stage: ApiStage.Process, server: task.Server, taskId: task.Task);
+
+            return new ProcessResult(
+                status,
+                json.TryGetProperty("download_filename", out var d) ? d.GetString() : null,
+                GetLong(json, "filesize"),
+                GetLong(json, "output_filesize"),
+                (int)GetLong(json, "output_filenumber"));
+        }
+        finally
         {
-            Content = new StringContent(payload, Encoding.UTF8, "application/json")
-        }, ApiStage.Process, _resilience.ProcessTimeout, server: task.Server, taskId: task.Task, ct);
-
-        var json = await ReadJsonAsync(res, ApiStage.Process, task.Server, task.Task, ct);
-        var status = json.TryGetProperty("status", out var st) ? st.GetString() ?? "" : "";
-        if (!status.StartsWith("TaskSuccess", StringComparison.Ordinal))
-            throw new ApiException(ApiErrorKind.Rejected, $"iLoveAPI could not process the file (status: {(status.Length == 0 ? "unknown" : status)}).",
-                stage: ApiStage.Process, server: task.Server, taskId: task.Task);
-
-        return new ProcessResult(
-            status,
-            json.TryGetProperty("download_filename", out var d) ? d.GetString() : null,
-            GetLong(json, "filesize"),
-            GetLong(json, "output_filesize"),
-            (int)GetLong(json, "output_filenumber"));
+            trace?.RecordStageMs(ApiStage.Process, (int)sw.ElapsedMilliseconds);
+        }
     }
 
     /// <summary>Downloads the task output (a single file, or a ZIP when there is more than one) to <paramref name="destination"/>.</summary>
     public async Task DownloadAsync(ApiTask task, string destination, CancellationToken ct = default)
     {
-        var uri = new Uri(_serverBase(task.Server), $"download/{task.Task}");
-        var maxAttempts = Math.Max(1, _resilience.MaxAttempts);
-
-        for (int attempt = 1; ; attempt++)
+        var trace = CurrentTrace.Value;
+        using var span = Telemetry.StartSpan("api.download", trace?.CorrelationId, ActivityKind.Client);
+        span?.SetTag("pdftools.server", task.Server);
+        var sw = Stopwatch.StartNew();
+        try
         {
-            using var res = await SendAsync(
-                () => new HttpRequestMessage(HttpMethod.Get, uri),
-                ApiStage.Download, _resilience.TransferTimeout, server: task.Server, taskId: task.Task, ct);
+            var uri = new Uri(_serverBase(task.Server), $"download/{task.Task}");
+            var maxAttempts = Math.Max(1, _resilience.MaxAttempts);
 
-            if (!res.IsSuccessStatusCode)
+            for (int attempt = 1; ; attempt++)
             {
-                var ex = ToException((int)res.StatusCode, await SafeReadAsync(res, ct), ApiStage.Download, task.Server, task.Task);
-                if (ex.Kind is ApiErrorKind.Auth or ApiErrorKind.Credits)
-                    CircuitBreaker.TripTerminal(ex.Kind, ex.Message);
-                throw ex;
-            }
+                using var res = await SendAsync(
+                    () => new HttpRequestMessage(HttpMethod.Get, uri),
+                    ApiStage.Download, _resilience.TransferTimeout, server: task.Server, taskId: task.Task, ct);
 
-            using var timeoutCts = new CancellationTokenSource(_resilience.TransferTimeout, _time);
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-            try
-            {
-                var expectedLength = res.Content.Headers.ContentLength;
-                await using (var src = await res.Content.ReadAsStreamAsync(linkedCts.Token))
-                await using (var dst = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true))
+                if (!res.IsSuccessStatusCode)
                 {
-                    await src.CopyToAsync(dst, 81920, linkedCts.Token);
-                    await dst.FlushAsync(linkedCts.Token);
+                    var ex = ToException((int)res.StatusCode, await SafeReadAsync(res, ct), ApiStage.Download, task.Server, task.Task);
+                    if (ex.Kind is ApiErrorKind.Auth or ApiErrorKind.Credits)
+                        CircuitBreaker.TripTerminal(ex.Kind, ex.Message);
+                    throw ex;
+                }
 
-                    if (expectedLength.HasValue && dst.Length != expectedLength.Value)
-                        throw new HttpRequestException($"Incomplete download ({dst.Length} of {expectedLength.Value} bytes).");
-                }
-                CircuitBreaker.RecordSuccess();
-                return;
-            }
-            catch (HttpRequestException ex)
-            {
-                CircuitBreaker.RecordTransientFailure(ApiErrorKind.Network);
-                if (attempt < maxAttempts)
+                using var timeoutCts = new CancellationTokenSource(_resilience.TransferTimeout, _time);
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+                try
                 {
-                    Interlocked.Increment(ref _totalRetries);
-                    var delay = RetryPolicy.ComputeBackoff(attempt, _resilience.BaseBackoff, _resilience.MaxBackoff, _jitter);
-                    await RetryPolicy.DelayAsync(delay, _time, ct);
-                    continue;
+                    var expectedLength = res.Content.Headers.ContentLength;
+                    await using (var src = await res.Content.ReadAsStreamAsync(linkedCts.Token))
+                    await using (var dst = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true))
+                    {
+                        await src.CopyToAsync(dst, 81920, linkedCts.Token);
+                        await dst.FlushAsync(linkedCts.Token);
+
+                        if (expectedLength.HasValue && dst.Length != expectedLength.Value)
+                            throw new HttpRequestException($"Incomplete download ({dst.Length} of {expectedLength.Value} bytes).");
+                    }
+                    CircuitBreaker.RecordSuccess();
+                    return;
                 }
-                throw new ApiException(ApiErrorKind.Network, "Download was interrupted. Check your internet connection and try again.",
-                    null, ex, ApiStage.Download, task.Server, task.Task);
-            }
-            catch (IOException ex) when (ex.InnerException is System.Net.Sockets.SocketException or HttpRequestException)
-            {
-                CircuitBreaker.RecordTransientFailure(ApiErrorKind.Network);
-                if (attempt < maxAttempts)
+                catch (HttpRequestException ex)
                 {
-                    Interlocked.Increment(ref _totalRetries);
-                    var delay = RetryPolicy.ComputeBackoff(attempt, _resilience.BaseBackoff, _resilience.MaxBackoff, _jitter);
-                    await RetryPolicy.DelayAsync(delay, _time, ct);
-                    continue;
+                    CircuitBreaker.RecordTransientFailure(ApiErrorKind.Network);
+                    if (attempt < maxAttempts)
+                    {
+                        RecordRetry(ApiStage.Download);
+                        var delay = RetryPolicy.ComputeBackoff(attempt, _resilience.BaseBackoff, _resilience.MaxBackoff, _jitter);
+                        await RetryPolicy.DelayAsync(delay, _time, ct);
+                        continue;
+                    }
+                    throw new ApiException(ApiErrorKind.Network, "Download was interrupted. Check your internet connection and try again.",
+                        null, ex, ApiStage.Download, task.Server, task.Task);
                 }
-                throw new ApiException(ApiErrorKind.Network, "Download was interrupted. Check your internet connection and try again.",
-                    null, ex, ApiStage.Download, task.Server, task.Task);
-            }
-            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
-            {
-                CircuitBreaker.RecordTransientFailure(ApiErrorKind.Network);
-                if (attempt < maxAttempts)
+                catch (IOException ex) when (ex.InnerException is System.Net.Sockets.SocketException or HttpRequestException)
                 {
-                    Interlocked.Increment(ref _totalRetries);
-                    var delay = RetryPolicy.ComputeBackoff(attempt, _resilience.BaseBackoff, _resilience.MaxBackoff, _jitter);
-                    await RetryPolicy.DelayAsync(delay, _time, ct);
-                    continue;
+                    CircuitBreaker.RecordTransientFailure(ApiErrorKind.Network);
+                    if (attempt < maxAttempts)
+                    {
+                        RecordRetry(ApiStage.Download);
+                        var delay = RetryPolicy.ComputeBackoff(attempt, _resilience.BaseBackoff, _resilience.MaxBackoff, _jitter);
+                        await RetryPolicy.DelayAsync(delay, _time, ct);
+                        continue;
+                    }
+                    throw new ApiException(ApiErrorKind.Network, "Download was interrupted. Check your internet connection and try again.",
+                        null, ex, ApiStage.Download, task.Server, task.Task);
                 }
-                throw new ApiException(ApiErrorKind.Network, "The download from iLoveAPI timed out.",
-                    null, ex, ApiStage.Download, task.Server, task.Task);
+                catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+                {
+                    CircuitBreaker.RecordTransientFailure(ApiErrorKind.Network);
+                    if (attempt < maxAttempts)
+                    {
+                        RecordRetry(ApiStage.Download);
+                        var delay = RetryPolicy.ComputeBackoff(attempt, _resilience.BaseBackoff, _resilience.MaxBackoff, _jitter);
+                        await RetryPolicy.DelayAsync(delay, _time, ct);
+                        continue;
+                    }
+                    throw new ApiException(ApiErrorKind.Network, "The download from iLoveAPI timed out.",
+                        null, ex, ApiStage.Download, task.Server, task.Task);
+                }
             }
+        }
+        finally
+        {
+            trace?.RecordStageMs(ApiStage.Download, (int)sw.ElapsedMilliseconds);
         }
     }
 
     /// <summary>Best-effort cleanup of the task and its files on the server. Never throws.</summary>
     public async Task DeleteTaskAsync(ApiTask task)
     {
+        var trace = CurrentTrace.Value;
+        using var span = Telemetry.StartSpan("api.delete", trace?.CorrelationId, ActivityKind.Client);
         try
         {
             if (CircuitBreaker.State == CircuitState.Open) return;
@@ -341,10 +497,20 @@ public sealed class ILoveApiClient : IDisposable
             req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", await GetTokenAsync(cts.Token));
             using var res = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cts.Token);
         }
-        catch { /* server deletes tasks after 2 hours anyway */ }
+        catch (Exception ex)
+        {
+            DiagnosticsLog.Write("ILoveApiClient", $"Best-effort DELETE task {task.Task} on {task.Server} failed", ex, trace?.CorrelationId);
+        }
     }
 
     // ------------------------------------------------------------------ plumbing
+
+    private void RecordRetry(ApiStage stage)
+    {
+        Interlocked.Increment(ref _totalRetries);
+        CurrentTrace.Value?.RecordRetry();
+        Telemetry.ApiRetries.Add(1, new KeyValuePair<string, object?>("stage", stage.ToString()));
+    }
 
     private async Task<HttpResponseMessage> SendAsync(
         Func<HttpRequestMessage> make,
@@ -393,7 +559,7 @@ public sealed class ILoveApiClient : IDisposable
                 CircuitBreaker.RecordTransientFailure(ApiErrorKind.Network);
                 if (attempt < maxAttempts)
                 {
-                    Interlocked.Increment(ref _totalRetries);
+                    RecordRetry(stage);
                     var delay = RetryPolicy.ComputeBackoff(attempt, _resilience.BaseBackoff, _resilience.MaxBackoff, _jitter);
                     attempt++;
                     await RetryPolicy.DelayAsync(delay, _time, ct);
@@ -407,7 +573,7 @@ public sealed class ILoveApiClient : IDisposable
                 CircuitBreaker.RecordTransientFailure(ApiErrorKind.Network);
                 if (attempt < maxAttempts)
                 {
-                    Interlocked.Increment(ref _totalRetries);
+                    RecordRetry(stage);
                     var delay = RetryPolicy.ComputeBackoff(attempt, _resilience.BaseBackoff, _resilience.MaxBackoff, _jitter);
                     attempt++;
                     await RetryPolicy.DelayAsync(delay, _time, ct);
@@ -444,7 +610,7 @@ public sealed class ILoveApiClient : IDisposable
                 if (attempt < maxAttempts)
                 {
                     res.Dispose();
-                    Interlocked.Increment(ref _totalRetries);
+                    RecordRetry(stage);
                     attempt++;
                     await RetryPolicy.DelayAsync(delay, _time, ct);
                     continue;
@@ -462,7 +628,7 @@ public sealed class ILoveApiClient : IDisposable
                         ? retryAfter
                         : RetryPolicy.ComputeBackoff(attempt, _resilience.BaseBackoff, _resilience.MaxBackoff, _jitter);
                     res.Dispose();
-                    Interlocked.Increment(ref _totalRetries);
+                    RecordRetry(stage);
                     attempt++;
                     await RetryPolicy.DelayAsync(delay, _time, ct);
                     continue;

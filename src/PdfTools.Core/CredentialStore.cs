@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using PdfTools.Core.ILoveApi;
+using PdfTools.Core.Observability;
 
 namespace PdfTools.Core;
 
@@ -24,8 +25,8 @@ public static class CredentialStore
             var key = Encoding.UTF8.GetString(plain).Trim();
             return key.Length == 0 ? null : key;
         }
-        catch (CryptographicException) { return null; }   // other user / corrupt
-        catch (IOException) { return null; }
+        catch (CryptographicException ex) { DiagnosticsLog.Write("CredentialStore", "Could not decrypt stored API key", ex); return null; }
+        catch (IOException ex) { DiagnosticsLog.Write("CredentialStore", "Could not read credentials file", ex); return null; }
     }
 
     public static void SavePublicKey(string key)

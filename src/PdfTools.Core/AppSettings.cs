@@ -1,4 +1,5 @@
 using System.Text.Json;
+using PdfTools.Core.Observability;
 
 namespace PdfTools.Core;
 
@@ -36,7 +37,10 @@ public sealed class AppSettings
                 if (s != null) { s.Normalize(); return s; }
             }
         }
-        catch { /* corrupt file -> defaults */ }
+        catch (Exception ex)
+        {
+            DiagnosticsLog.Write("AppSettings", "Corrupt or unreadable settings.json; falling back to defaults", ex);
+        }
         return new AppSettings();
     }
 
