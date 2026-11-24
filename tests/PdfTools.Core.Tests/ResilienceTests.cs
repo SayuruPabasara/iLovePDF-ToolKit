@@ -152,6 +152,7 @@ internal sealed class FailingBodyStream : Stream
     }
 }
 
+[Collection("DataDir")]
 public class ResilienceTests : IDisposable
 {
     private readonly string _dir;

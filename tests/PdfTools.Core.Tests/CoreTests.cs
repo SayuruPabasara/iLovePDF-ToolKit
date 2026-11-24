@@ -52,6 +52,10 @@ internal sealed class FakeApi : HttpMessageHandler
         new("pub_key_123", region, new HttpClient(this));
 }
 
+[CollectionDefinition("DataDir", DisableParallelization = true)]
+public sealed class DataDirCollection { }
+
+[Collection("DataDir")]
 public class CoreTests : IDisposable
 {
     private readonly string _dir;
