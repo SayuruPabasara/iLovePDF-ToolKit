@@ -27,10 +27,8 @@ public sealed record JobItemResult(
 public sealed class JobService
 {
     private const int MaxParallel = 3;
-
-    private static readonly string[] PdfExt = { ".pdf" };
-    private static readonly string[] OfficeExt = { ".doc", ".docx", ".ppt", ".pptx" };
-    private static readonly string[] ImageExt = { ".jpg", ".jpeg" };
+    private const int MaxUploadParallel = 3;
+    internal const long MaxExtractedPdfBytes = 512L * 1024 * 1024; // 512 MB ZIP bomb guard
 
     private readonly Func<ILoveApiClient> _clientFactory;
     private readonly AppSettings _settings;
@@ -55,23 +53,26 @@ public sealed class JobService
         _ => k.ToString()
     };
 
-    private static string[] AllowedExt(JobKind k) => k switch
-    {
-        JobKind.Compress or JobKind.Merge => PdfExt,
-        JobKind.OfficeToPdf => OfficeExt,
-        _ => ImageExt
-    };
-
-    // ------------------------------------------------------------------ public entry point
-
     public async Task<IReadOnlyList<JobItemResult>> RunAsync(JobKind kind, IReadOnlyList<string> files, CancellationToken ct = default)
     {
         var results = new List<JobItemResult>();
         var valid = new List<string>();
+        var dirCheckCache = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var f in files.Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            var problem = Validate(kind, f);
+            var problem = PreflightValidator.ValidateFile(kind, f);
+            if (problem == null)
+            {
+                var dir = Path.GetDirectoryName(f) ?? "";
+                if (!dirCheckCache.TryGetValue(dir, out var dirErr))
+                {
+                    dirErr = PreflightValidator.ValidateDirectoryWritable(dir);
+                    dirCheckCache[dir] = dirErr;
+                }
+                problem = dirErr;
+            }
+
             if (problem != null) results.Add(Fail(kind, new[] { f }, problem, 0));
             else valid.Add(f);
         }
@@ -163,9 +164,7 @@ public sealed class JobService
         {
             task = await client.StartAsync(u.Tool, ct);
 
-            var uploaded = new List<UploadedFile>();
-            foreach (var f in u.Inputs)
-                uploaded.Add(new UploadedFile(await client.UploadAsync(task, f, ct), Path.GetFileName(f)));
+            var uploaded = await UploadAllOrderedAsync(client, task, u.Inputs, ct);
 
             await client.ProcessAsync(task, u.Tool, uploaded, u.Extra, ct);
 
@@ -240,16 +239,36 @@ public sealed class JobService
 
     // ------------------------------------------------------------------ helpers
 
-    private static string? Validate(JobKind kind, string path)
+    private static async Task<UploadedFile[]> UploadAllOrderedAsync(
+        ILoveApiClient client, ApiTask task, IReadOnlyList<string> inputs, CancellationToken ct)
     {
-        var name = Path.GetFileName(path);
-        if (!File.Exists(path)) return $"{name}: file not found.";
-        var ext = Path.GetExtension(path).ToLowerInvariant();
-        if (Array.IndexOf(AllowedExt(kind), ext) < 0)
-            return $"{name}: unsupported file type for \"{OperationName(kind)}\".";
-        try { if (new FileInfo(path).Length == 0) return $"{name}: file is empty."; }
-        catch (IOException) { return $"{name}: cannot read file."; }
-        return null;
+        var uploaded = new UploadedFile[inputs.Count];
+        if (inputs.Count == 1)
+        {
+            var f = inputs[0];
+            uploaded[0] = new UploadedFile(await client.UploadAsync(task, f, ct), Path.GetFileName(f));
+            return uploaded;
+        }
+
+        using var uploadGate = new SemaphoreSlim(Math.Min(MaxUploadParallel, inputs.Count));
+        var tasks = new Task[inputs.Count];
+        for (int i = 0; i < inputs.Count; i++)
+        {
+            int idx = i;
+            var f = inputs[idx];
+            tasks[idx] = Task.Run(async () =>
+            {
+                await uploadGate.WaitAsync(ct);
+                try
+                {
+                    var serverName = await client.UploadAsync(task, f, ct);
+                    uploaded[idx] = new UploadedFile(serverName, Path.GetFileName(f));
+                }
+                finally { uploadGate.Release(); }
+            }, ct);
+        }
+        await Task.WhenAll(tasks);
+        return uploaded;
     }
 
     private JobItemResult Fail(JobKind kind, IReadOnlyList<string> inputs, string message, double seconds)
@@ -275,12 +294,26 @@ public sealed class JobService
         catch (IOException) { return false; }
     }
 
-    private static bool ExtractFirstPdf(string zipPath, string destination)
+    internal static bool ExtractFirstPdf(string zipPath, string destination, long maxBytes = MaxExtractedPdfBytes)
     {
         using var zip = ZipFile.OpenRead(zipPath);
         var entry = zip.Entries.FirstOrDefault(e => e.FullName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase));
         if (entry == null) return false;
-        entry.ExtractToFile(destination, overwrite: true);
+        if (entry.Length > maxBytes)
+            throw new ApiException(ApiErrorKind.Rejected, "iLoveAPI returned an unexpectedly large archive entry.");
+
+        using var src = entry.Open();
+        using var dst = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.None, 81920);
+        var buf = new byte[81920];
+        long total = 0;
+        int n;
+        while ((n = src.Read(buf, 0, buf.Length)) > 0)
+        {
+            total += n;
+            if (total > maxBytes)
+                throw new ApiException(ApiErrorKind.Rejected, "iLoveAPI returned an unexpectedly large archive entry.");
+            dst.Write(buf, 0, n);
+        }
         return true;
     }
 

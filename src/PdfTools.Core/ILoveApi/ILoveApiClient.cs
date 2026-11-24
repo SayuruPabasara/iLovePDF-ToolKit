@@ -24,11 +24,14 @@ public sealed class ILoveApiClient : IDisposable
     private readonly ResilienceOptions _resilience;
     private readonly TimeProvider _time;
     private readonly Func<double>? _jitter;
+    private readonly ITokenCache _tokenCache;
+    private readonly string _tokenCacheKey;
 
     private string? _token;
     private DateTimeOffset _tokenExpires;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
     private int _totalRetries;
+    private int _authNetworkCalls;
 
     /// <summary>Credits left, as reported by the last /start call (null if unknown).</summary>
     public int? RemainingCredits { get; private set; }
@@ -42,6 +45,9 @@ public sealed class ILoveApiClient : IDisposable
     /// <summary>Total retries performed by this client instance across all operations.</summary>
     public int TotalRetries => Volatile.Read(ref _totalRetries);
 
+    /// <summary>Number of /auth network requests issued by this client (0 when served from token cache).</summary>
+    public int AuthNetworkCalls => Volatile.Read(ref _authNetworkCalls);
+
     public ILoveApiClient(
         string publicKey,
         string? region = null,
@@ -52,7 +58,8 @@ public sealed class ILoveApiClient : IDisposable
         CircuitBreaker? circuitBreaker = null,
         AdaptiveRateLimiter? rateLimiter = null,
         TimeProvider? timeProvider = null,
-        Func<double>? jitterSource = null)
+        Func<double>? jitterSource = null,
+        ITokenCache? tokenCache = null)
     {
         if (string.IsNullOrWhiteSpace(publicKey)) throw new ArgumentException("API key is required.", nameof(publicKey));
         _publicKey = publicKey.Trim();
@@ -62,6 +69,8 @@ public sealed class ILoveApiClient : IDisposable
         _resilience = resilience ?? ResilienceOptions.Default;
         _time = timeProvider ?? TimeProvider.System;
         _jitter = jitterSource;
+        _tokenCache = tokenCache ?? DpapiTokenCache.Shared;
+        _tokenCacheKey = DpapiTokenCache.ComputeCacheKey(_publicKey, _apiBase);
 
         CircuitBreaker = circuitBreaker ?? new CircuitBreaker(
             _resilience.CircuitFailureThreshold,
@@ -74,7 +83,14 @@ public sealed class ILoveApiClient : IDisposable
 
         if (http == null)
         {
-            _http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };   // per-stage cancellation instead
+            var handler = new SocketsHttpHandler
+            {
+                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+                ConnectTimeout = TimeSpan.FromSeconds(15),
+                EnableMultipleHttp2Connections = true,
+                AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+            };
+            _http = new HttpClient(handler, disposeHandler: true) { Timeout = Timeout.InfiniteTimeSpan };   // per-stage cancellation instead
             _ownsHttp = true;
         }
         else _http = http;
@@ -96,8 +112,23 @@ public sealed class ILoveApiClient : IDisposable
         await _tokenLock.WaitAsync(ct);
         try
         {
-            if (!force && _token != null && _time.GetUtcNow() < _tokenExpires) return _token;
+            var now = _time.GetUtcNow();
+            if (!force && _token != null && now < _tokenExpires) return _token;
 
+            if (!force && _tokenCache.TryGet(_tokenCacheKey, now, out var cachedToken, out var cachedExp))
+            {
+                _token = cachedToken;
+                _tokenExpires = cachedExp;
+                return cachedToken;
+            }
+
+            if (force)
+            {
+                _token = null;
+                _tokenCache.Clear();
+            }
+
+            Interlocked.Increment(ref _authNetworkCalls);
             var uri = new Uri(_apiBase, "auth");
             // Form-encoded first (what the official libraries send); JSON as fallback.
             using var res = await SendAsync(() => new HttpRequestMessage(HttpMethod.Post, uri)
@@ -129,6 +160,7 @@ public sealed class ILoveApiClient : IDisposable
                 }
                 _token = token;
                 _tokenExpires = _time.GetUtcNow().AddMinutes(50);   // tokens live 1 hour
+                _tokenCache.Set(_tokenCacheKey, token, _tokenExpires);
                 return token;
             }
             finally { second?.Dispose(); }

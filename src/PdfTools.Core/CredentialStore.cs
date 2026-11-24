@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using PdfTools.Core.ILoveApi;
 
 namespace PdfTools.Core;
 
@@ -15,6 +16,7 @@ public static class CredentialStore
 
     public static string? LoadPublicKey()
     {
+        if (!OperatingSystem.IsWindows()) return null;
         try
         {
             if (!File.Exists(AppPaths.CredentialFile)) return null;
@@ -28,15 +30,19 @@ public static class CredentialStore
 
     public static void SavePublicKey(string key)
     {
+        if (!OperatingSystem.IsWindows())
+            throw new PlatformNotSupportedException("Windows DPAPI credential storage requires Windows.");
         key = (key ?? "").Trim();
         if (key.Length == 0) throw new ArgumentException("Key is empty.", nameof(key));
         AppPaths.EnsureDataDir();
         var cipher = ProtectedData.Protect(Encoding.UTF8.GetBytes(key), Entropy, DataProtectionScope.CurrentUser);
         AtomicFile.WriteAllBytes(AppPaths.CredentialFile, cipher);
+        DpapiTokenCache.ClearFile();
     }
 
     public static void Clear()
     {
         try { if (File.Exists(AppPaths.CredentialFile)) File.Delete(AppPaths.CredentialFile); } catch (IOException) { }
+        DpapiTokenCache.ClearFile();
     }
 }

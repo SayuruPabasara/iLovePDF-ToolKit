@@ -391,9 +391,10 @@ public class ResilienceTests : IDisposable
             ProcessBody = "{\"error\":{\"type\":\"ProcessingError\",\"message\":\"x\",\"param\":[{\"status\":\"WrongPassword\"}]}}"
         };
 
-        var f1 = Path.Combine(_dir, "a.pdf"); File.WriteAllBytes(f1, new byte[100]);
-        var f2 = Path.Combine(_dir, "b.pdf"); File.WriteAllBytes(f2, new byte[100]);
-        var f3 = Path.Combine(_dir, "c.pdf"); File.WriteAllBytes(f3, new byte[100]);
+        var pdfBytes = "%PDF-1.4 dummy-content"u8.ToArray();
+        var f1 = Path.Combine(_dir, "a.pdf"); File.WriteAllBytes(f1, pdfBytes);
+        var f2 = Path.Combine(_dir, "b.pdf"); File.WriteAllBytes(f2, pdfBytes);
+        var f3 = Path.Combine(_dir, "c.pdf"); File.WriteAllBytes(f3, pdfBytes);
 
         using var client = new ILoveApiClient("pub_k", http: new HttpClient(api), circuitBreaker: breaker);
         var svc = new JobService(() => new ILoveApiClient("pub_k", http: new HttpClient(api), circuitBreaker: breaker), new AppSettings());
@@ -409,10 +410,11 @@ public class ResilienceTests : IDisposable
     public async Task CircuitBreaker_TerminalAuthError_FastFailsRemainingBatchFiles()
     {
         var api = new FakeApi { AuthStatus = 401 };
+        var pdfBytes = "%PDF-1.4 dummy-content"u8.ToArray();
         var files = Enumerable.Range(1, 5).Select(i =>
         {
             var p = Path.Combine(_dir, $"f{i}.pdf");
-            File.WriteAllBytes(p, new byte[200]);
+            File.WriteAllBytes(p, pdfBytes);
             return p;
         }).ToList();
 

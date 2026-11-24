@@ -75,7 +75,19 @@ public class CoreTests : IDisposable
     private string MakeFile(string name, int size = 1000)
     {
         var p = Path.Combine(_dir, name);
-        File.WriteAllBytes(p, Enumerable.Repeat((byte)'x', size).ToArray());
+        var buf = Enumerable.Repeat((byte)'x', Math.Max(size, 1)).ToArray();
+        var ext = Path.GetExtension(name).ToLowerInvariant();
+        byte[] prefix = ext switch
+        {
+            ".pdf" => "%PDF-1.4\n"u8.ToArray(),
+            ".jpg" or ".jpeg" => new byte[] { 0xFF, 0xD8, 0xFF, 0xE0 },
+            ".docx" or ".pptx" => new byte[] { 0x50, 0x4B, 0x03, 0x04 },
+            ".doc" or ".ppt" => new byte[] { 0xD0, 0xCF, 0x11, 0xE0 },
+            _ => Array.Empty<byte>()
+        };
+        if (prefix.Length > 0 && size >= prefix.Length)
+            Buffer.BlockCopy(prefix, 0, buf, 0, prefix.Length);
+        File.WriteAllBytes(p, buf);
         return p;
     }
 
