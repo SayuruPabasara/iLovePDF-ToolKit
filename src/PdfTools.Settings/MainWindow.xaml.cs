@@ -1,15 +1,23 @@
 using System.Diagnostics;
+using System.IO;
 using System.Reflection;
 using System.Windows;
-using System.Windows.Documents;
+using System.Windows.Controls;
 using System.Windows.Media;
 using PdfTools.Core;
 using PdfTools.Core.ILoveApi;
-   using System.IO;
+using PdfTools.Core.Observability;
 
 namespace PdfTools.Settings;
 
-public sealed record LogRow(string Time, string Operation, string Files, string Status, string Details);
+public sealed record LogRow(
+    string Time,
+    string Operation,
+    string Files,
+    string Status,
+    string Duration,
+    string Details,
+    LogEntry Entry);
 
 public partial class MainWindow : Window
 {
@@ -26,8 +34,19 @@ public partial class MainWindow : Window
         ("Germany (de)", "de"), ("Poland (pl)", "pl"), ("India (in)", "in"), ("Singapore (sg)", "sg")
     };
 
+    private static readonly string[] OperationOptions =
+    {
+        "All actions", "Compress", "Merge", "Convert to PDF", "Image to PDF", "Combine images"
+    };
+
+    private static readonly string[] StatusOptions =
+    {
+        "All results", "Success", "NoGain", "Skipped", "Failed"
+    };
+
     private readonly AppSettings _settings = AppSettings.Load();
     private IReadOnlyList<LogEntry> _entries = Array.Empty<LogEntry>();
+    private int _refreshVersion;
 
     public MainWindow(bool showLogs)
     {
@@ -39,13 +58,18 @@ public partial class MainWindow : Window
         RegionBox.SelectedIndex = Math.Max(0, Array.FindIndex(Regions, r => r.Value == _settings.Region));
         RetentionBox.Text = _settings.LogRetentionDays.ToString();
 
+        foreach (var op in OperationOptions) OperationFilter.Items.Add(op);
+        foreach (var st in StatusOptions) StatusFilter.Items.Add(st);
+        OperationFilter.SelectedIndex = 0;
+        StatusFilter.SelectedIndex = 0;
+
         var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "1.0.0";
         AboutTitle.Text = $"iLovePDF Tools {version}";
         AboutPaths.Text = $"Settings and logs are stored in:\n{AppPaths.DataDir}";
 
         UpdateKeyStatus();
-        RefreshLog();
         if (showLogs) Tabs.SelectedIndex = 1;
+        Loaded += async (_, _) => await RefreshLogAsync();
     }
 
     // ------------------------------------------------------------------ key
@@ -74,7 +98,7 @@ public partial class MainWindow : Window
         KeyMessage.Foreground = Brushes.Gray;
         try
         {
-            using var client = new ILoveApiClient(key, _settings.Region);
+            using var client = new ILoveApiClient(key, _settings.Region, tokenCache: NullTokenCache.Instance);
             await client.ValidateKeyAsync();
             CredentialStore.SavePublicKey(key);
             KeyBox.Clear();
@@ -121,30 +145,133 @@ public partial class MainWindow : Window
         }
     }
 
-    // ------------------------------------------------------------------ log
+    // ------------------------------------------------------------------ log & diagnostics
 
-    private void RefreshLog()
+    private async Task RefreshLogAsync()
     {
-        _entries = LogReader.ReadRecent();
-        ApplyFilter();
+        int myVersion = Interlocked.Increment(ref _refreshVersion);
+        RefreshLogButton.IsEnabled = false;
+        try
+        {
+            var loaded = await LogReader.ReadRecentAsync();
+            if (myVersion != Volatile.Read(ref _refreshVersion)) return;
+            _entries = loaded;
+            UpdateMetrics();
+            ApplyFilter();
+        }
+        catch (Exception ex)
+        {
+            DiagnosticsLog.Write("Settings", "Failed loading activity log", ex);
+        }
+        finally
+        {
+            if (myVersion == Volatile.Read(ref _refreshVersion))
+                RefreshLogButton.IsEnabled = true;
+        }
+    }
+
+    private void UpdateMetrics()
+    {
+        var m = LogMetricsSummary.Compute(_entries);
+        MetricJobs.Text = m.TotalJobs.ToString();
+        MetricSuccessRate.Text = m.TotalJobs == 0 ? "\u2014" : $"{m.SuccessRatePercent:0.#}%";
+        MetricSaved.Text = OutputNaming.FormatSize(m.TotalBytesSaved);
+        MetricAvgTime.Text = m.AverageSeconds > 0 ? $"{m.AverageSeconds:0.#} s" : "\u2014";
+        MetricRetriesFailures.Text = $"{m.TotalRetries} / {m.FailedCount}";
     }
 
     private void ApplyFilter()
     {
-        bool failuresOnly = FailuresOnly?.IsChecked == true;
+        string? opFilter = OperationFilter?.SelectedIndex > 0 ? OperationFilter.SelectedItem as string : null;
+        string? statusFilter = StatusFilter?.SelectedIndex > 0 ? StatusFilter.SelectedItem as string : null;
+        string query = (SearchBox?.Text ?? "").Trim();
+
         LogGrid.ItemsSource = _entries
-            .Where(en => !failuresOnly || en.Status == "Failed")
+            .Where(en => opFilter == null || string.Equals(en.Operation, opFilter, StringComparison.OrdinalIgnoreCase))
+            .Where(en => statusFilter == null || string.Equals(en.Status, statusFilter, StringComparison.OrdinalIgnoreCase))
+            .Where(en => query.Length == 0 || MatchesQuery(en, query))
             .Select(en => new LogRow(
                 en.Time.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss"),
                 en.Operation,
                 string.Join(", ", en.Inputs),
                 en.Status,
-                en.Message ?? en.Output ?? ""))
+                en.Seconds.HasValue ? $"{en.Seconds.Value:0.#}" : "",
+                en.Message ?? en.Output ?? "",
+                en))
             .ToList();
+
+        UpdateDetailPanel(null);
     }
 
-    private void RefreshLog_Click(object sender, RoutedEventArgs e) => RefreshLog();
-    private void FilterChanged(object sender, RoutedEventArgs e) { if (IsLoaded) ApplyFilter(); }
+    private static bool MatchesQuery(LogEntry en, string query)
+    {
+        if (en.Inputs.Any(f => f.Contains(query, StringComparison.OrdinalIgnoreCase))) return true;
+        if (en.Output != null && en.Output.Contains(query, StringComparison.OrdinalIgnoreCase)) return true;
+        if (en.Message != null && en.Message.Contains(query, StringComparison.OrdinalIgnoreCase)) return true;
+        if (en.CorrelationId != null && en.CorrelationId.Contains(query, StringComparison.OrdinalIgnoreCase)) return true;
+        if (en.ApiServer != null && en.ApiServer.Contains(query, StringComparison.OrdinalIgnoreCase)) return true;
+        if (en.ErrorKind != null && en.ErrorKind.Contains(query, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    private void UpdateDetailPanel(LogEntry? en)
+    {
+        if (en == null)
+        {
+            DetailHeader.Text = "Select a log entry to inspect correlation ID, server node, retries, and per-stage timings.";
+            DetailTimings.Text = "";
+            return;
+        }
+
+        var parts = new List<string>();
+        if (!string.IsNullOrEmpty(en.CorrelationId)) parts.Add($"ID: {en.CorrelationId}");
+        if (!string.IsNullOrEmpty(en.ApiServer)) parts.Add($"Server: {en.ApiServer}");
+        if (!string.IsNullOrEmpty(en.FailedStage)) parts.Add($"Failed stage: {en.FailedStage}");
+        if (!string.IsNullOrEmpty(en.ErrorKind)) parts.Add($"Kind: {en.ErrorKind}");
+        if (en.HttpStatus.HasValue) parts.Add($"HTTP {en.HttpStatus}");
+        if (en.RetryCount is > 0) parts.Add($"Retries: {en.RetryCount}");
+        if (en.InputBytes.HasValue && en.OutputBytes.HasValue)
+            parts.Add($"Size: {OutputNaming.FormatSize(en.InputBytes.Value)} \u2192 {OutputNaming.FormatSize(en.OutputBytes.Value)}");
+        else if (en.InputBytes.HasValue)
+            parts.Add($"Input: {OutputNaming.FormatSize(en.InputBytes.Value)}");
+
+        DetailHeader.Text = parts.Count > 0 ? string.Join("  \u2022  ", parts) : $"{en.Operation} ({en.Status})";
+
+        var timings = new List<string>();
+        if (en.Timings != null)
+        {
+            if (en.Timings.AuthMs.HasValue) timings.Add($"Auth: {en.Timings.AuthMs} ms");
+            if (en.Timings.StartMs.HasValue) timings.Add($"Start: {en.Timings.StartMs} ms");
+            if (en.Timings.UploadMs.HasValue) timings.Add($"Upload: {en.Timings.UploadMs} ms");
+            if (en.Timings.ProcessMs.HasValue) timings.Add($"Process: {en.Timings.ProcessMs} ms");
+            if (en.Timings.DownloadMs.HasValue) timings.Add($"Download: {en.Timings.DownloadMs} ms");
+        }
+        DetailTimings.Text = timings.Count > 0
+            ? "Stage timings: " + string.Join("  |  ", timings)
+            : (en.Message ?? "No stage timing breakdown recorded for this entry.");
+    }
+
+    private async void RefreshLog_Click(object sender, RoutedEventArgs e) => await RefreshLogAsync();
+    private void FilterChanged(object sender, SelectionChangedEventArgs e) { if (IsLoaded) ApplyFilter(); }
+    private void SearchChanged(object sender, TextChangedEventArgs e) { if (IsLoaded) ApplyFilter(); }
+    private void LogGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        => UpdateDetailPanel((LogGrid.SelectedItem as LogRow)?.Entry);
+
+    private async void CopyDiagnostics_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var report = DiagnosticReportBuilder.Build(_settings, _entries);
+            Clipboard.SetText(report);
+            CopyDiagButton.Content = "Copied!";
+            await Task.Delay(1500);
+            CopyDiagButton.Content = "Copy diagnostics";
+        }
+        catch (Exception ex)
+        {
+            DiagnosticsLog.Write("Settings", "Failed copying diagnostic report", ex);
+        }
+    }
 
     private void OpenLogFolder_Click(object sender, RoutedEventArgs e)
     {
@@ -153,7 +280,10 @@ public partial class MainWindow : Window
             Directory.CreateDirectory(AppPaths.LogDir);
             Process.Start(new ProcessStartInfo("explorer.exe", $"\"{AppPaths.LogDir}\"") { UseShellExecute = true });
         }
-        catch { }
+        catch (Exception ex)
+        {
+            DiagnosticsLog.Write("Settings", "Failed opening log folder", ex);
+        }
     }
 
     // ------------------------------------------------------------------ misc
