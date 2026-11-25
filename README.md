@@ -1,8 +1,6 @@
 <div align="center">
 
-  <img src="assets/ilovepdf.svg" alt="iLovePDF" height="40" align="middle"> +
-  <img src="assets/iloveapi.svg" alt="iLoveAPI" height="40" align="middle"> &rarr;
-  <img src="assets/app.ico" alt="iLovePDF Tools" width="52" height="52" align="middle">
+  <img src="assets/hero.svg" alt="iLovePDF + iLoveAPI → iLovePDF Tools" width="640">
 
   # iLovePDF Tools
 
@@ -167,6 +165,7 @@ flowchart TB
 iLovePDFToolKit/
 ├── assets/
 │   ├── app.ico                                 # Application & context-menu icon
+│   ├── hero.svg                                # README integration hero banner
 │   ├── ilovepdf.svg                            # Official iLovePDF brand logo
 │   └── iloveapi.svg                            # Official iLoveAPI brand logo
 ├── installer/
