@@ -19,6 +19,11 @@
 
 ---
 
+<p align="center">
+  <img src="assets/explorer-context-menu.jpg" alt="Windows File Explorer right-click menu showing iLovePDF Compress PDF and Merge PDFs" width="760">
+</p>
+
+
 ## 📄 Supported Actions
 
 Skip opening a browser, uploading files, and renaming downloads. **Select files** in File Explorer, **right-click** (**Show more options** or `Shift + F10` on Windows 11), and **pick an action** - results save right next to the originals and never overwrite existing files.
@@ -50,6 +55,19 @@ Skip opening a browser, uploading files, and renaming downloads. **Select files*
 - **Activity Log & KPI Strip** - Live summary of total jobs, success rate, space saved, average duration, and retries/failures, with action, status, and text search filters.
 - **Per-Job Diagnostics** - Click any log entry to inspect its correlation ID, API worker server, HTTP status, retries, and per-stage timings (`Auth`, `Start`, `Upload`, `Process`, `Download`), or export a redacted report with **Copy diagnostics**.
 
+<table>
+  <tr>
+    <td align="center">
+      <img src="assets/settings-ui.jpg" alt="iLovePDF Tools Settings tab" width="420"><br>
+      <sub><b>Settings</b> — API key management &amp; processing options</sub>
+    </td>
+    <td align="center">
+      <img src="assets/activity-log-ui.jpg" alt="iLovePDF Tools Activity log tab" width="420"><br>
+      <sub><b>Activity Log</b> — KPI metrics, job history &amp; diagnostics</sub>
+    </td>
+  </tr>
+</table>
+
 ---
 
 ## 🛠️ Tech Stack
@@ -71,10 +89,18 @@ Skip opening a browser, uploading files, and renaming downloads. **Select files*
 1. Create a free account at [iloveapi.com/signup](https://www.iloveapi.com/signup).
 2. Copy your project's **Public Key** (`project_public_...`) from [My Projects / API Keys](https://www.iloveapi.com/user/projects). *(Your secret key is never needed or stored.)*
 
+<p align="center">
+  <img src="assets/iloveapi-public-key.png" alt="iLoveAPI console API keys page highlighting the Public Key copy button" width="760">
+</p>
+
 ### 2. Install
 Run `iLovePDFTools-Setup-1.0.0.exe` (built via [`build.ps1`](build.ps1)):
 - No UAC / administrator privileges required.
 - The wizard verifies your public key live during setup. Silent installs (`/SILENT` or `/VERYSILENT`) skip the key prompt so you can add it later in **Start Menu → iLovePDF Tools Settings**.
+
+<p align="center">
+  <img src="assets/installer-setup.jpg" alt="iLovePDF Tools installer wizard prompting for the iLoveAPI public key" width="760">
+</p>
 
 > [!WARNING]
 > The installer is currently unsigned, so Windows SmartScreen may show *"Unknown publisher"*. Click **More info → Run anyway**, or compile it directly from source below.
@@ -164,10 +190,15 @@ flowchart TB
 ```text
 iLovePDFToolKit/
 ├── assets/
+│   ├── activity-log-ui.jpg                     # Activity log & KPI metrics screenshot
 │   ├── app.ico                                 # Application & context-menu icon
+│   ├── explorer-context-menu.jpg               # File Explorer right-click menu screenshot
 │   ├── hero.svg                                # README integration hero banner
+│   ├── iloveapi-public-key.png                 # iLoveAPI Public Key copy guide screenshot
+│   ├── iloveapi.svg                            # Official iLoveAPI brand logo
 │   ├── ilovepdf.svg                            # Official iLovePDF brand logo
-│   └── iloveapi.svg                            # Official iLoveAPI brand logo
+│   ├── installer-setup.jpg                     # Installer wizard public-key prompt screenshot
+│   └── settings-ui.jpg                         # Settings UI screenshot
 ├── installer/
 │   ├── PdfTools.iss                            # Per-user Inno Setup 6 installer & HKCU shell verbs
 │   └── verify-key.ps1                          # Live iLoveAPI public-key check during setup
