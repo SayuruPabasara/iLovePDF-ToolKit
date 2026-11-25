@@ -1,6 +1,6 @@
 <div align="center">
 
-  <img src="assets/hero.svg" alt="iLovePDF + iLoveAPI → iLovePDF Tools" width="640">
+  <img src="assets/hero.svg" alt="iLovePDF + iLoveAPI → iLovePDF Tools" width="100%">
 
   # iLovePDF Tools
 
