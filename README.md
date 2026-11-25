@@ -1,6 +1,8 @@
 <div align="center">
 
-  <img src="assets/app.ico" alt="iLovePDF Tools logo" width="68" height="68">
+  <img src="assets/ilovepdf.svg" alt="iLovePDF" height="40" align="middle"> +
+  <img src="assets/iloveapi.svg" alt="iLoveAPI" height="40" align="middle"> &rarr;
+  <img src="assets/app.ico" alt="iLovePDF Tools" width="52" height="52" align="middle">
 
   # iLovePDF Tools
 
@@ -164,7 +166,9 @@ flowchart TB
 ```text
 iLovePDFToolKit/
 ├── assets/
-│   └── app.ico                                 # Application & context-menu icon
+│   ├── app.ico                                 # Application & context-menu icon
+│   ├── ilovepdf.svg                            # Official iLovePDF brand logo
+│   └── iloveapi.svg                            # Official iLoveAPI brand logo
 ├── installer/
 │   ├── PdfTools.iss                            # Per-user Inno Setup 6 installer & HKCU shell verbs
 │   └── verify-key.ps1                          # Live iLoveAPI public-key check during setup
