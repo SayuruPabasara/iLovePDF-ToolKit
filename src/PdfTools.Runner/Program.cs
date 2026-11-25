@@ -24,6 +24,7 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        ToastNotificationService.InitializeProcess();
         Application.SetHighDpiMode(HighDpiMode.SystemAware);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);

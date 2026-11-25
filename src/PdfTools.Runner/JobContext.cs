@@ -8,20 +8,21 @@ using PdfTools.Core.Jobs;
 namespace PdfTools.Runner;
 
 /// <summary>
-/// Runs queued batches with no window of its own: progress and results are shown as Windows notifications
-/// (tray balloon -> toast), with a tray context menu for live status and graceful cancellation.
-/// Exits automatically once the queue drains and the final notification window expires.
+/// Runs queued batches with no window of its own: progress and results are shown as native Windows 10/11
+/// Toast notifications (with automatic fallback to tray balloon tips), paired with a tray context menu for
+/// live status and graceful cancellation. Exits automatically once the queue drains and the click window expires.
 /// </summary>
 internal sealed class JobContext : ApplicationContext
 {
     private readonly RunnerServer _server;
+    private readonly ToastNotificationService _notifications = new();
     private readonly NotifyIcon _tray;
     private readonly ContextMenuStrip _menu;
     private readonly ToolStripMenuItem _statusItem;
     private readonly ToolStripMenuItem _cancelCurrentItem;
     private readonly ToolStripMenuItem _cancelAllItem;
     private readonly Control _ui;
-    private readonly System.Windows.Forms.Timer _exitTimer = new() { Interval = 9000 };
+    private readonly System.Windows.Forms.Timer _exitTimer = new() { Interval = 15000 };
 
     private readonly InFlightJobTracker _inFlight = new();
     private readonly object _stateLock = new();
@@ -30,6 +31,10 @@ internal sealed class JobContext : ApplicationContext
     private string? _clientKey;
     private string? _clientRegion;
     private CancellationTokenSource? _currentBatchCts;
+    private int _batchSeq;
+    private string? _activeProgressTag;
+    private string _lastOutcomeStatus = "Done";
+    private bool _usedBalloonFallback;
     private bool _busy;
     private Action? _onClick;
     private bool _quit;
@@ -68,6 +73,7 @@ internal sealed class JobContext : ApplicationContext
         _exitTimer.Tick += (_, _) => TryQuitIfIdle();
         _server.BatchArrived += OnBatchArrived;
 
+        ToastNotificationService.EnsureRegistered();
         _ = Task.Run(ProcessQueueAsync);
     }
 
@@ -95,13 +101,16 @@ internal sealed class JobContext : ApplicationContext
         }
         catch (Exception ex)
         {
-            Show("iLovePDF Tools", "Unexpected error: " + ex.Message, ToolTipIcon.Error,
+            var tag = NextBatchTag();
+            _lastOutcomeStatus = "Error";
+            Show(tag, "iLovePDF Tools", "Unexpected error: " + ex.Message, ToolTipIcon.Error,
                  () => Shell.OpenSettings("--logs"), final: true);
         }
     }
 
     private async Task RunBatchAsync(QueuedBatch batch)
     {
+        var batchTag = NextBatchTag();
         CancellationTokenSource? batchCts = null;
         try
         {
@@ -111,7 +120,9 @@ internal sealed class JobContext : ApplicationContext
             var key = CredentialStore.LoadPublicKey();
             if (key == null)
             {
-                Show("iLovePDF Tools needs an API key",
+                _lastOutcomeStatus = "API key required";
+                UpdateStatus(_lastOutcomeStatus);
+                Show(batchTag, "iLovePDF Tools needs an API key",
                      "Click here to open Settings and enter your iLoveAPI key.",
                      ToolTipIcon.Warning, () => Shell.OpenSettings(), final: true);
                 return;
@@ -122,7 +133,7 @@ internal sealed class JobContext : ApplicationContext
 
             var startText = StartText(batch.Kind, batch.Files);
             UpdateStatus(startText);
-            Show("iLovePDF Tools", startText, ToolTipIcon.Info, null, final: false);
+            Show(batchTag, "iLovePDF Tools", startText, ToolTipIcon.Info, null, final: false);
 
             batchCts = new CancellationTokenSource(TimeSpan.FromMinutes(15));
             lock (_stateLock) _currentBatchCts = batchCts;
@@ -143,11 +154,12 @@ internal sealed class JobContext : ApplicationContext
                 disposeClient: false);
 
             var results = await service.RunAsync(batch.Kind, batch.Files, batchCts.Token, progress);
-            Summarize(batch.Kind, results, service.LastRemainingCredits);
+            Summarize(batchTag, batch.Kind, results, service.LastRemainingCredits);
         }
         catch (Exception ex)
         {
-            Show("iLovePDF Tools", "Unexpected error: " + ex.Message, ToolTipIcon.Error,
+            _lastOutcomeStatus = "Error";
+            Show(batchTag, "iLovePDF Tools", "Unexpected error: " + ex.Message, ToolTipIcon.Error,
                  () => Shell.OpenSettings("--logs"), final: true);
         }
         finally
@@ -160,6 +172,8 @@ internal sealed class JobContext : ApplicationContext
             OnUi(UpdateMenuState);
         }
     }
+
+    private string NextBatchTag() => $"job-{Interlocked.Increment(ref _batchSeq)}";
 
     private ILoveApiClient GetOrCreateClient(string key, string region)
     {
@@ -192,11 +206,15 @@ internal sealed class JobContext : ApplicationContext
         lock (_stateLock) _busy = busy;
         OnUi(() =>
         {
+            if (_quit) return;
             UpdateMenuState();
             if (!busy && IsIdle())
             {
-                _statusItem.Text = "Done";
-                _tray.Text = "iLovePDF Tools";
+                _statusItem.Text = Trunc(_lastOutcomeStatus, 60);
+                // Avoid calling Shell_NotifyIcon(NIM_MODIFY) right after a fallback balloon tip,
+                // as modifying NotifyIcon.Text immediately can suppress/clear legacy balloons.
+                if (!_usedBalloonFallback)
+                    _tray.Text = "iLovePDF Tools";
                 _exitTimer.Stop();
                 _exitTimer.Start();
             }
@@ -247,7 +265,7 @@ internal sealed class JobContext : ApplicationContext
         };
     }
 
-    private void Summarize(JobKind kind, IReadOnlyList<JobItemResult> results, int? credits)
+    private void Summarize(string batchTag, JobKind kind, IReadOnlyList<JobItemResult> results, int? credits)
     {
         var ok = results.Where(r => r.Status == JobStatus.Success).ToList();
         var noGain = results.Where(r => r.Status == JobStatus.NoGain).ToList();
@@ -297,17 +315,63 @@ internal sealed class JobContext : ApplicationContext
         }
 
         if (credits is >= 0 and <= 25) text += $" Credits left: {credits}.";
-        Show(title, text, icon, click, final: true);
+        _lastOutcomeStatus = title;
+        Show(batchTag, title, text, icon, click, final: true);
     }
 
-    private void Show(string title, string text, ToolTipIcon icon, Action? onClick, bool final)
+    private void Show(string tag, string title, string text, ToolTipIcon icon, Action? onClick, bool final)
+    {
+        lock (_stateLock)
+        {
+            if (!final)
+                _activeProgressTag = tag;
+            else if (string.Equals(_activeProgressTag, tag, StringComparison.Ordinal))
+                _activeProgressTag = null;
+        }
+
+        var shortTitle = Trunc(title, 60);
+        var shortText = Trunc(text, 240);
+
+        Action? wrappedClick = onClick == null ? null : () =>
+        {
+            try { onClick(); } catch { }
+            OnUi(TryQuitIfIdle);
+        };
+
+        var delivered = _notifications.TryShow(
+            shortTitle,
+            shortText,
+            tag,
+            silent: !final,
+            isProgress: !final,
+            onActivated: wrappedClick,
+            onFailedFallback: () => ShowBalloonFallback(shortTitle, shortText, icon, onClick, final));
+
+        if (!delivered)
+        {
+            ShowBalloonFallback(shortTitle, shortText, icon, onClick, final);
+            return;
+        }
+
+        if (final)
+        {
+            OnUi(() =>
+            {
+                if (_quit) return;
+                if (IsIdle()) { _exitTimer.Stop(); _exitTimer.Start(); }
+            });
+        }
+    }
+
+    private void ShowBalloonFallback(string title, string text, ToolTipIcon icon, Action? onClick, bool final)
     {
         OnUi(() =>
         {
             if (_quit) return;
+            _usedBalloonFallback = true;
             _onClick = onClick;
-            _tray.BalloonTipTitle = Trunc(title, 60);
-            _tray.BalloonTipText = Trunc(text, 240);
+            _tray.BalloonTipTitle = title;
+            _tray.BalloonTipText = text;
             _tray.BalloonTipIcon = icon;
             _tray.ShowBalloonTip(10000);
             if (final && IsIdle()) { _exitTimer.Stop(); _exitTimer.Start(); }
@@ -338,6 +402,16 @@ internal sealed class JobContext : ApplicationContext
         _quit = true;
         _server.BatchArrived -= OnBatchArrived;
         _server.StopAccepting();
+
+        string? staleProgress;
+        lock (_stateLock)
+        {
+            staleProgress = _activeProgressTag;
+            _activeProgressTag = null;
+        }
+        if (staleProgress != null)
+            _notifications.Remove(staleProgress);
+
         _exitTimer.Stop();
         _exitTimer.Dispose();
         _sharedClient?.Dispose();

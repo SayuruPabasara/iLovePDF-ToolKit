@@ -33,12 +33,16 @@ Source: "..\artifacts\publish\*"; DestDir: "{app}"; Flags: ignoreversion recurse
 Source: "verify-key.ps1"; Flags: dontcopy
 
 [Icons]
-Name: "{autoprograms}\iLovePDF Tools Settings"; Filename: "{app}\PdfToolsSettings.exe"
+Name: "{autoprograms}\iLovePDF Tools Settings"; Filename: "{app}\PdfToolsSettings.exe"; AppUserModelID: "Internal.iLovePDFTools"
 
 ; Right-click entries (classic menu = "Show more options" on Windows 11). Per-user, so no admin needed.
 ; File types with more than one tool (.pdf, .jpg, .jpeg) get a single "iLovePDF" cascading submenu.
 ; File types with a single tool (.doc, .docx, .ppt, .pptx) stay as one flat entry.
 [Registry]
+; --- Register AUMID for native Windows 10/11 Toast notifications ---
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\Internal.iLovePDFTools"; ValueType: string; ValueName: "DisplayName"; ValueData: "iLovePDF Tools"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\Internal.iLovePDFTools"; ValueType: string; ValueName: "IconUri"; ValueData: "{app}\app.ico"
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\Internal.iLovePDFTools"; ValueType: string; ValueName: "IconBackgroundColor"; ValueData: "0"
 ; --- Clean up the old flat entries from earlier versions (prevents duplicates after upgrade) ---
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools.Compress"; Flags: deletekey
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PdfTools.Merge"; Flags: deletekey
