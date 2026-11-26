@@ -15,11 +15,12 @@
   [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
   
-  [Supported Actions](#-supported-actions) · [Key Features](#-key-features) · [Tech Stack](#-tech-stack) · [Quick Start](#-quick-start--usage) · [Architecture](#-system-architecture) · [Engineering Highlights](#-engineering-highlights) · [Privacy](#-privacy--local-data) · [Build & Tests](#-building--running-tests) · [License](#-license--disclaimer)
+  [Supported Actions](#-supported-actions) • [Key Features](#-key-features) • [Tech Stack](#-tech-stack) • [Quick Start](#-quick-start--usage) • [Architecture](#-system-architecture) • [Engineering Highlights](#-engineering-highlights) • [Privacy](#-privacy--local-data) • [Build & Tests](#-building--running-tests) • [License](#-license--disclaimer)
 
 </div>
 
 ---
+<br>
 <p align="center">
     <a href="https://github.com/SayuruPabasara/iLovePDFToolKit/releases/latest/download/iLovePDFTools-Setup-1.0.0.exe">
       <img src="https://img.shields.io/badge/Download%20Installer-Windows%20x64%20(v1.0.0)-E5322D?style=for-the-badge&logo=windows&logoColor=white" alt="Download iLovePDF Tools Installer for Windows x64">
