@@ -12,8 +12,15 @@
   [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011%20(x64)-0078D6?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
   [![Tests](https://img.shields.io/badge/xUnit-45%20Tests-2EA043?style=flat-square&logo=xunit&logoColor=white)](tests/PdfTools.Core.Tests)
   [![Inno Setup](https://img.shields.io/badge/Installer-Inno%20Setup%206-E5322D?style=flat-square)](installer/PdfTools.iss)
+  [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
-  [Supported Actions](#-supported-actions) · [Key Features](#-key-features) · [Tech Stack](#-tech-stack) · [Quick Start](#-quick-start--usage) · [Architecture](#-system-architecture) · [Engineering Highlights](#-engineering-highlights) · [Privacy](#-privacy--local-data) · [Build & Tests](#-building--running-tests)
+  <p>
+    <a href="https://github.com/SayuruPabasara/iLovePDFToolKit/releases/latest/download/iLovePDFTools-Setup-1.0.0.exe">
+      <img src="https://img.shields.io/badge/Download%20Installer-Windows%20x64%20(v1.0.0)-E5322D?style=for-the-badge&logo=windows&logoColor=white" alt="Download iLovePDF Tools Installer for Windows x64">
+    </a>
+  </p>
+
+  [Supported Actions](#-supported-actions) · [Key Features](#-key-features) · [Tech Stack](#-tech-stack) · [Quick Start](#-quick-start--usage) · [Architecture](#-system-architecture) · [Engineering Highlights](#-engineering-highlights) · [Privacy](#-privacy--local-data) · [Build & Tests](#-building--running-tests) · [License](#-license--disclaimer)
 
 </div>
 
@@ -94,7 +101,7 @@ Skip opening a browser, uploading files, and renaming downloads. **Select files*
 </p>
 
 ### 2. Install
-Run `iLovePDFTools-Setup-1.0.0.exe` (built via [`build.ps1`](build.ps1)):
+Download and run **[`iLovePDFTools-Setup-1.0.0.exe`](https://github.com/SayuruPabasara/iLovePDFToolKit/releases/latest/download/iLovePDFTools-Setup-1.0.0.exe)** <br><br>(or browse [all releases](https://github.com/SayuruPabasara/iLovePDFToolKit/releases) / build from source via [`build.ps1`](build.ps1)):
 - No UAC / administrator privileges required.
 - The wizard verifies your public key live during setup. Silent installs (`/SILENT` or `/VERYSILENT`) skip the key prompt so you can add it later in **Start Menu → iLovePDF Tools Settings**.
 
@@ -189,6 +196,10 @@ flowchart TB
 
 ```text
 iLovePDFToolKit/
+├── .github/
+│   └── workflows/
+│       ├── ci.yml                              # Automated xUnit test & build verification
+│       └── release.yml                         # Tagged release packaging & SHA-256 publishing
 ├── assets/
 │   ├── activity-log-ui.jpg                     # Activity log & KPI metrics screenshot
 │   ├── app.ico                                 # Application & context-menu icon
@@ -228,6 +239,7 @@ iLovePDFToolKit/
 │       └── ObservabilityTests.cs               # LogEntry v2, reverse-chunk tail reader, redaction & spans
 ├── build.ps1                                   # Test, self-contained publish & Inno Setup packaging script
 ├── Directory.Build.props                       # Shared C# 12, nullable & version properties
+├── LICENSE                                     # MIT License
 └── PdfTools.sln
 ```
 
@@ -274,6 +286,13 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 - **Password-protected PDFs** - iLoveAPI rejects encrypted PDFs; unlock them before compressing or merging.
 - **Quotas & size limits** - Free iLoveAPI plans enforce a monthly file quota (notifications warn automatically when ≤25 credits remain). Local pre-flight validation caps individual files at `250 MB`.
 - **Reporting an issue** - Open **iLovePDF Tools Settings → Activity log → Copy diagnostics** and paste the redacted summary into a [GitHub Issue](https://github.com/SayuruPabasara/iLovePDFToolKit/issues).
+
+---
+
+## 📄 License & Disclaimer
+
+- **License:** Distributed under the [MIT License](LICENSE).
+- **Disclaimer:** This is an independent, community-built open-source utility powered by the official [iLoveAPI](https://www.iloveapi.com/). It is not affiliated with, endorsed by, or officially connected to iLovePDF or iLoveAPI. All product names and brand logos belong to their respective owners.
 
 ---
 

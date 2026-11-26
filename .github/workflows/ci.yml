@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Run unit tests
+        run: dotnet test tests/PdfTools.Core.Tests -c Release --verbosity normal
+
+      - name: Build Runner and Settings apps
+        run: |
+          dotnet build src/PdfTools.Runner -c Release
+          dotnet build src/PdfTools.Settings -c Release
+

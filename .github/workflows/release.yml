@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Ensure Inno Setup 6 is installed
+        shell: pwsh
+        run: |
+          $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Run tests and build installer
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Generate SHA-256 checksum
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -Path artifacts -Filter 'iLovePDFTools-Setup-*.exe' | Select-Object -First 1
+          if (-not $installer) { throw "Installer .exe not found in artifacts/" }
+          $hash = (Get-FileHash -Path $installer.FullName -Algorithm SHA256).Hash
+          "$hash  $($installer.Name)" | Out-File -FilePath artifacts\SHA256SUMS.txt -Encoding ascii
+          Write-Host "Installer: $($installer.Name)"
+          Write-Host "SHA256: $hash"
+          "INSTALLER_PATH=$($installer.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INSTALLER_NAME=$($installer.Name)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INSTALLER_SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @"
+          ### Installation
+          Download and run ``$env:INSTALLER_NAME`` (per-user installer, no admin rights required).
+
+          > **Note:** The installer is unsigned, so Windows SmartScreen may show *"Unknown publisher"*. Click **More info → Run anyway**, or verify the SHA-256 checksum below.
+
+          ### SHA-256 Checksum
+          ``````text
+          $env:INSTALLER_SHA256  $env:INSTALLER_NAME
+          ``````
+          "@
+          gh release create "${{ github.ref_name }}" "$env:INSTALLER_PATH" "artifacts\SHA256SUMS.txt" --title "iLovePDF Tools ${{ github.ref_name }}" --notes "$notes" --generate-notes
