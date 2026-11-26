@@ -34,7 +34,7 @@
 
 ## 📄 Supported Actions
 
-Skip opening a browser, uploading files, and renaming downloads. **Select files** in File Explorer, **right-click** (**Show more options** or `Shift + F10` on Windows 11), and **pick an action** - results save right next to the originals and never overwrite existing files.
+Skip opening a browser, uploading files, and renaming downloads. <br>**Select files** in File Explorer, **right-click** (**Show more options** or `Shift + F10` on Windows 11), and **pick an action** - results save right next to the originals and never overwrite existing files.
 
 | File Types | Context Menu Entry | Output Naming | Behavior |
 | :--- | :--- | :--- | :--- |
